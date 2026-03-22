@@ -1,27 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 const GRAPHQL_URL: &str = "https://sleeper.com/graphql";
-const TOKEN_FILE: &str = ".sleeper_token";
-const TOKEN_MAX_AGE_HOURS: i64 = 24;
 
-const LOGIN_QUERY: &str = r#"query login_query($email_or_phone_or_username: String!, $password: String) {
-  login(email_or_phone_or_username: $email_or_phone_or_username, password: $password) {
-    token
-    avatar
-    cookies
-    created
-    display_name
-    real_name
-    email
-    notifications
-    phone
-    user_id
-    verification
-    data_updated
-  }
-}"#;
+/// Warn when the token expires within this many days.
+const TOKEN_EXPIRY_WARNING_DAYS: i64 = 30;
 
 const CREATE_MESSAGE_MUTATION: &str = r#"mutation create_message($text: String!, $parent_type: String!, $parent_id: Snowflake!) {
   create_message(text: $text, parent_type: $parent_type, parent_id: $parent_id) {
@@ -40,27 +23,6 @@ struct GraphqlRequest {
 }
 
 #[derive(Deserialize)]
-struct LoginResponse {
-    data: Option<LoginData>,
-    errors: Option<Vec<GraphqlError>>,
-}
-
-#[derive(Deserialize)]
-struct LoginData {
-    login: Option<LoginResult>,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct LoginResult {
-    token: Option<String>,
-    user_id: Option<String>,
-    display_name: Option<String>,
-    avatar: Option<String>,
-    email: Option<String>,
-}
-
-#[derive(Deserialize)]
 #[allow(dead_code)]
 struct SendMessageResponse {
     data: Option<serde_json::Value>,
@@ -72,134 +34,67 @@ struct GraphqlError {
     message: String,
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedToken {
-    token: String,
-    created_at: i64,
+/// JWT claims we care about for expiry checking.
+#[derive(Deserialize)]
+struct JwtClaims {
+    exp: Option<i64>,
 }
 
 pub struct SleeperGraphql {
     client: reqwest::Client,
-    token: Option<String>,
-    username: String,
-    password: String,
+    token: String,
 }
 
 impl SleeperGraphql {
-    pub fn new(username: String, password: String) -> Self {
-        Self {
+    /// Create a client with a token from SLEEPER_TOKEN env var.
+    /// Checks expiry and warns if the token is close to expiring or already expired.
+    pub fn new(token: String) -> Result<Self> {
+        // Validate and check expiry
+        match decode_jwt_expiry(&token) {
+            Ok(Some(exp)) => {
+                let now = chrono::Utc::now().timestamp();
+                let days_remaining = (exp - now) / 86400;
+
+                if days_remaining < 0 {
+                    anyhow::bail!(
+                        "SLEEPER_TOKEN has expired! \
+                        Log into sleeper.app in your browser, grab a fresh token from \
+                        DevTools → Application → Local Storage, and update SLEEPER_TOKEN in your .env file."
+                    );
+                } else if days_remaining <= TOKEN_EXPIRY_WARNING_DAYS {
+                    let expiry_date = chrono::DateTime::from_timestamp(exp, 0).unwrap_or_default();
+                    eprintln!(
+                        "⚠️  WARNING: SLEEPER_TOKEN expires in {days_remaining} day(s) (on {}).",
+                        expiry_date.format("%B %d, %Y")
+                    );
+                    eprintln!(
+                        "   Grab a fresh token from sleeper.app → DevTools → Application → Local Storage."
+                    );
+                } else {
+                    let expiry_date = chrono::DateTime::from_timestamp(exp, 0).unwrap_or_default();
+                    println!(
+                        "Token valid for {days_remaining} day(s) (expires {}).",
+                        expiry_date.format("%B %d, %Y")
+                    );
+                }
+            }
+            Ok(None) => {
+                eprintln!(
+                    "Warning: could not read token expiry — unable to check if it's still valid."
+                );
+            }
+            Err(e) => {
+                eprintln!("Warning: could not decode token ({e}) — unable to check expiry.");
+            }
+        }
+
+        Ok(Self {
             client: reqwest::Client::new(),
-            token: None,
-            username,
-            password,
-        }
+            token,
+        })
     }
 
-    /// Create a client with a pre-existing token, skipping login entirely.
-    /// Use this when you have a token from browser DevTools.
-    pub fn with_token(token: String) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            token: Some(token),
-            username: String::new(),
-            password: String::new(),
-        }
-    }
-
-    fn load_cached_token() -> Option<String> {
-        let path = Path::new(TOKEN_FILE);
-        if !path.exists() {
-            return None;
-        }
-        let data = std::fs::read_to_string(path).ok()?;
-        let cached: CachedToken = serde_json::from_str(&data).ok()?;
-        let now = chrono::Utc::now().timestamp();
-        if now - cached.created_at > TOKEN_MAX_AGE_HOURS * 3600 {
-            return None;
-        }
-        Some(cached.token)
-    }
-
-    fn save_token(token: &str) {
-        let cached = CachedToken {
-            token: token.to_string(),
-            created_at: chrono::Utc::now().timestamp(),
-        };
-        if let Ok(json) = serde_json::to_string(&cached) {
-            let _ = std::fs::write(TOKEN_FILE, json);
-        }
-    }
-
-    pub async fn login(&mut self) -> Result<()> {
-        // Try cached token first
-        if let Some(token) = Self::load_cached_token() {
-            self.token = Some(token);
-            return Ok(());
-        }
-
-        let req = GraphqlRequest {
-            operation_name: "login_query",
-            query: LOGIN_QUERY,
-            variables: serde_json::json!({
-                "email_or_phone_or_username": self.username,
-                "password": self.password,
-            }),
-        };
-
-        let resp = self
-            .client
-            .post(GRAPHQL_URL)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-            .json(&req)
-            .send()
-            .await
-            .context("Failed to connect to Sleeper GraphQL API")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Sleeper login failed (HTTP {status}): {body}\n\
-                Check SLEEPER_USERNAME and SLEEPER_PASSWORD."
-            );
-        }
-
-        let login_resp: LoginResponse = resp
-            .json()
-            .await
-            .context("Failed to parse login response")?;
-
-        if let Some(errors) = login_resp.errors {
-            let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
-            anyhow::bail!(
-                "Sleeper login error: {}\n\
-                Check SLEEPER_USERNAME and SLEEPER_PASSWORD.",
-                msgs.join(", ")
-            );
-        }
-
-        let token = login_resp
-            .data
-            .and_then(|d| d.login)
-            .and_then(|l| l.token)
-            .context(
-                "No token in login response. \
-                Check SLEEPER_USERNAME and SLEEPER_PASSWORD.",
-            )?;
-
-        Self::save_token(&token);
-        self.token = Some(token);
-        Ok(())
-    }
-
-    pub async fn send_message(&mut self, league_id: &str, message: &str) -> Result<()> {
-        let token = self
-            .token
-            .as_ref()
-            .context("Not logged in — call login() first")?
-            .clone();
-
+    pub async fn send_message(&self, league_id: &str, message: &str) -> Result<()> {
         let req = GraphqlRequest {
             operation_name: "create_message",
             query: CREATE_MESSAGE_MUTATION,
@@ -215,7 +110,7 @@ impl SleeperGraphql {
             .post(GRAPHQL_URL)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
-            .header("Authorization", token.to_string())
+            .header("Authorization", &self.token)
             .json(&req)
             .send()
             .await
@@ -223,12 +118,12 @@ impl SleeperGraphql {
 
         let status = resp.status();
 
-        // If 401, try re-login once
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            let _ = std::fs::remove_file(TOKEN_FILE);
-            self.token = None;
-            self.login().await?;
-            return Box::pin(self.send_message(league_id, message)).await;
+            anyhow::bail!(
+                "Sleeper returned 401 Unauthorized. Your token may have expired.\n\
+                Grab a fresh token from sleeper.app → DevTools → Application → Local Storage \
+                and update SLEEPER_TOKEN in your .env file."
+            );
         }
 
         if !status.is_success() {
@@ -250,23 +145,61 @@ impl SleeperGraphql {
     }
 
     pub fn is_authenticated(&self) -> bool {
-        self.token.is_some()
+        !self.token.is_empty()
     }
+}
+
+/// Decode the expiry timestamp from a JWT without verifying the signature.
+/// Returns Ok(Some(exp_timestamp)) or Ok(None) if the exp claim is missing.
+fn decode_jwt_expiry(token: &str) -> Result<Option<i64>> {
+    use base64::prelude::*;
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("Invalid JWT format (expected 3 parts, got {})", parts.len());
+    }
+
+    // Decode the payload (second part) — JWT uses base64url without padding
+    let payload_bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .context("Failed to base64-decode JWT payload")?;
+
+    let claims: JwtClaims =
+        serde_json::from_slice(&payload_bytes).context("Failed to parse JWT claims")?;
+
+    Ok(claims.exp)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[ignore]
-    #[tokio::test]
-    async fn test_graphql_login() {
-        dotenvy::dotenv().ok();
-        let username = std::env::var("SLEEPER_USERNAME").expect("SLEEPER_USERNAME required");
-        let password = std::env::var("SLEEPER_PASSWORD").expect("SLEEPER_PASSWORD required");
+    #[test]
+    fn test_decode_jwt_expiry() {
+        // Craft a minimal JWT: header.payload.signature
+        // payload = {"exp": 1805745375}
+        use base64::prelude::*;
+        let header = BASE64_URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(r#"{"exp":1805745375,"user_id":"123"}"#);
+        let token = format!("{header}.{payload}.fakesignature");
 
-        let mut gql = SleeperGraphql::new(username, password);
-        gql.login().await.unwrap();
-        assert!(gql.is_authenticated());
+        let exp = decode_jwt_expiry(&token).unwrap();
+        assert_eq!(exp, Some(1805745375));
+    }
+
+    #[test]
+    fn test_decode_jwt_no_exp() {
+        use base64::prelude::*;
+        let header = BASE64_URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(r#"{"user_id":"123"}"#);
+        let token = format!("{header}.{payload}.fakesig");
+
+        let exp = decode_jwt_expiry(&token).unwrap();
+        assert_eq!(exp, None);
+    }
+
+    #[test]
+    fn test_decode_jwt_invalid() {
+        assert!(decode_jwt_expiry("not-a-jwt").is_err());
     }
 }

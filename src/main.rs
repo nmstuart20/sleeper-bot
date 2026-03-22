@@ -57,9 +57,9 @@ enum Cli {
     },
     /// Debug the GraphQL connection
     Debug {
-        /// Test login and print the response
+        /// Verify the token is valid and check expiry
         #[arg(long)]
-        login: bool,
+        check_token: bool,
         /// Send a test message to the league chat
         #[arg(long)]
         send: Option<String>,
@@ -93,10 +93,10 @@ async fn main() -> Result<()> {
             run_watch(&league, interval, days, analyzer.as_ref()).await
         }
         Cli::Debug {
-            login,
+            check_token,
             send,
             league,
-        } => run_debug(login, send, league).await,
+        } => run_debug(check_token, send, league).await,
     }
 }
 
@@ -126,11 +126,11 @@ async fn run_check(
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
 
-    let mut gql = if post {
-        match setup_graphql().await {
+    let gql = if post {
+        match setup_graphql() {
             Ok(g) => Some(g),
             Err(e) => {
-                eprintln!("Warning: GraphQL login failed ({e}). Continuing in terminal-only mode.");
+                eprintln!("Warning: GraphQL setup failed ({e}). Continuing in terminal-only mode.");
                 None
             }
         }
@@ -142,7 +142,7 @@ async fn run_check(
         league_id,
         &mut sleeper,
         analyzer,
-        &mut gql,
+        &gql,
         &mut review_state,
         days,
     )
@@ -158,10 +158,10 @@ async fn run_watch(
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
 
-    let mut gql = match setup_graphql().await {
+    let gql = match setup_graphql() {
         Ok(g) => Some(g),
         Err(e) => {
-            eprintln!("Warning: GraphQL login failed ({e}). Continuing in terminal-only mode.");
+            eprintln!("Warning: GraphQL setup failed ({e}). Continuing in terminal-only mode.");
             None
         }
     };
@@ -175,7 +175,7 @@ async fn run_watch(
             league_id,
             &mut sleeper,
             analyzer,
-            &mut gql,
+            &gql,
             &mut review_state,
             days,
         )
@@ -187,14 +187,11 @@ async fn run_watch(
     }
 }
 
-async fn run_debug(login: bool, send: Option<String>, league: Option<String>) -> Result<()> {
-    if login {
-        println!("Testing GraphQL login...");
-        let mut gql = setup_graphql().await?;
-        println!(
-            "Login successful! Authenticated: {}",
-            gql.is_authenticated()
-        );
+async fn run_debug(check_token: bool, send: Option<String>, league: Option<String>) -> Result<()> {
+    if check_token {
+        println!("Checking SLEEPER_TOKEN...");
+        let gql = setup_graphql()?;
+        println!("Authenticated: {}", gql.is_authenticated());
 
         if let (Some(msg), Some(league_id)) = (send, league) {
             println!("Sending test message to league {league_id}...");
@@ -203,47 +200,36 @@ async fn run_debug(login: bool, send: Option<String>, league: Option<String>) ->
         }
     } else if let Some(msg) = send {
         let league_id = league.ok_or_else(|| anyhow::anyhow!("--league required with --send"))?;
-        let mut gql = setup_graphql().await?;
+        let gql = setup_graphql()?;
         println!("Sending test message to league {league_id}...");
         gql.send_message(&league_id, &msg).await?;
         println!("Message sent successfully!");
     } else {
         println!(
-            "Use --login to test authentication, --send <msg> --league <id> to send a test message."
+            "Use --check-token to verify your token, --send <msg> --league <id> to send a test message."
         );
     }
     Ok(())
 }
 
-async fn setup_graphql() -> Result<SleeperGraphql> {
-    // Prefer a direct token (avoids CAPTCHA issues with login)
-    if let Ok(token) = std::env::var("SLEEPER_TOKEN") {
-        println!("Using SLEEPER_TOKEN for authentication.");
-        return Ok(SleeperGraphql::with_token(token));
-    }
-
-    // Fall back to username/password login
-    let username = std::env::var("SLEEPER_USERNAME").map_err(|_| {
+fn setup_graphql() -> Result<SleeperGraphql> {
+    let token = std::env::var("SLEEPER_TOKEN").map_err(|_| {
         anyhow::anyhow!(
-            "Neither SLEEPER_TOKEN nor SLEEPER_USERNAME is set.\n\
-            Set SLEEPER_TOKEN with your auth token from browser DevTools \
-            (sleeper.app → DevTools → Application → Local Storage → look for token), \
-            or set SLEEPER_USERNAME + SLEEPER_PASSWORD to log in via GraphQL."
+            "SLEEPER_TOKEN is not set.\n\
+            To get your token: log into sleeper.app in your browser → \
+            DevTools (F12) → Application → Local Storage → copy your token.\n\
+            Then add SLEEPER_TOKEN=<your_token> to your .env file."
         )
     })?;
-    let password = std::env::var("SLEEPER_PASSWORD")
-        .map_err(|_| anyhow::anyhow!("SLEEPER_PASSWORD not set"))?;
 
-    let mut gql = SleeperGraphql::new(username, password);
-    gql.login().await?;
-    Ok(gql)
+    SleeperGraphql::new(token)
 }
 
 async fn process_trades(
     league_id: &str,
     sleeper: &mut SleeperClient,
     analyzer: &dyn TradeAnalyzer,
-    gql: &mut Option<SleeperGraphql>,
+    gql: &Option<SleeperGraphql>,
     review_state: &mut ReviewState,
     days: u64,
 ) -> Result<()> {

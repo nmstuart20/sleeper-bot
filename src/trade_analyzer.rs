@@ -115,7 +115,7 @@ pub fn build_prompt(summary: &TradeSummary) -> String {
         }
     }
 
-    msg.push_str("\nWho won this trade and why?");
+    msg.push_str("\nThis is a dynasty league. Factor in each player's age, injury history, contract situation, recent NFL news (signings, cuts, retirement buzz, depth chart changes), and long-term outlook. Who won this trade and why?");
     msg
 }
 

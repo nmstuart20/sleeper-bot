@@ -95,7 +95,7 @@ impl TradeAnalyzer for GeminiClient {
                     parts: vec![Part { text: prompt }],
                 }],
                 generation_config: GenerationConfig {
-                    max_output_tokens: 2048,
+                    max_output_tokens: 3000,
                 },
             };
 

@@ -53,7 +53,7 @@ impl TradeAnalyzer for AnthropicClient {
         Box::pin(async move {
             let body = Request {
                 model: MODEL,
-                max_tokens: 2048,
+                max_tokens: 3000,
                 system: SYSTEM_PROMPT,
                 messages: vec![Message {
                     role: "user",

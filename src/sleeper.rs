@@ -109,6 +109,32 @@ pub struct Player {
     pub position: Option<String>,
     #[serde(default)]
     pub team: Option<String>,
+    #[serde(default)]
+    pub age: Option<u32>,
+    #[serde(default)]
+    pub years_exp: Option<u32>,
+    #[serde(default)]
+    pub college: Option<String>,
+    #[serde(default)]
+    pub injury_status: Option<String>,
+    #[serde(default)]
+    pub injury_body_part: Option<String>,
+    #[serde(default)]
+    pub injury_notes: Option<String>,
+    #[serde(default)]
+    pub injury_start_date: Option<String>,
+    #[serde(default)]
+    pub depth_chart_order: Option<u32>,
+    #[serde(default)]
+    pub depth_chart_position: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub number: Option<u32>,
+    #[serde(default)]
+    pub birth_date: Option<String>,
+    #[serde(default)]
+    pub news_updated: Option<u64>,
 }
 
 impl Player {
@@ -116,6 +142,40 @@ impl Player {
         let first = self.first_name.as_deref().unwrap_or("");
         let last = self.last_name.as_deref().unwrap_or("");
         format!("{first} {last}").trim().to_string()
+    }
+
+    /// Build a rich context string with all available player metadata.
+    pub fn context_summary(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(age) = self.age {
+            parts.push(format!("Age: {age}"));
+        }
+        if let Some(exp) = self.years_exp {
+            parts.push(format!("Experience: {exp} yr(s)"));
+        }
+        if let Some(ref status) = self.status
+            && status != "Active"
+        {
+            parts.push(format!("Status: {status}"));
+        }
+        if let Some(ref injury) = self.injury_status {
+            let mut inj = format!("Injury: {injury}");
+            if let Some(ref part) = self.injury_body_part {
+                inj.push_str(&format!(" ({part})"));
+            }
+            if let Some(ref notes) = self.injury_notes {
+                inj.push_str(&format!(" - {notes}"));
+            }
+            parts.push(inj);
+        }
+        if let Some(order) = self.depth_chart_order
+            && let Some(ref pos) = self.depth_chart_position
+        {
+            parts.push(format!("Depth chart: #{order} {pos}"));
+        }
+
+        parts.join(", ")
     }
 }
 
@@ -418,6 +478,7 @@ mod tests {
                 last_name: Some("Waddle".to_string()),
                 position: Some("WR".to_string()),
                 team: Some("MIA".to_string()),
+                ..Default::default()
             },
         );
 

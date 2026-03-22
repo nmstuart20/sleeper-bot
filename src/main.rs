@@ -2,6 +2,7 @@ mod anthropic;
 mod gemini;
 mod graphql;
 mod llm;
+mod news;
 mod sleeper;
 mod state;
 mod trade_analyzer;
@@ -289,7 +290,18 @@ async fn process_trades(
                 }
             };
 
-        let prompt = trade_analyzer::build_prompt(&summary);
+        // Fetch recent news for players in the trade
+        println!("Fetching recent news for players...");
+        let news_by_id = news::fetch_player_news(&summary.player_ids, &players).await;
+
+        // Convert news map from player_id keys to display name keys
+        let mut player_news = std::collections::HashMap::new();
+        for (pid, news_text) in &news_by_id {
+            let name = sleeper::format_player_name(pid, &players);
+            player_news.insert(name, news_text.clone());
+        }
+
+        let prompt = trade_analyzer::build_prompt(&summary, &player_news);
         println!("\nTrade details:\n{prompt}\n");
 
         println!("Generating analysis...");

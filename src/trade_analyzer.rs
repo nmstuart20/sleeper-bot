@@ -8,6 +8,10 @@ pub struct TradeSummary {
     pub team_b_name: String,
     pub team_b_record: String,
     pub team_b_receives: Vec<String>,
+    /// Player IDs involved in the trade (for news fetching)
+    pub player_ids: Vec<String>,
+    /// Per-player context from Sleeper metadata (age, injury, depth chart, etc.)
+    pub player_context: HashMap<String, String>,
 }
 
 /// Parse a completed trade transaction into a human-readable TradeSummary.
@@ -29,11 +33,27 @@ pub fn parse_trade(
         receives.entry(rid).or_default();
     }
 
+    // Track player IDs and collect context from Sleeper metadata
+    let mut player_ids = Vec::new();
+    let mut player_context = HashMap::new();
+
     // Group player adds by receiving roster
     if let Some(ref adds) = tx.adds {
         for (player_id, &receiving_roster) in adds {
             let name = sleeper::format_player_name(player_id, players);
-            receives.entry(receiving_roster).or_default().push(name);
+            receives
+                .entry(receiving_roster)
+                .or_default()
+                .push(name.clone());
+
+            // Collect player metadata context
+            player_ids.push(player_id.clone());
+            if let Some(player) = players.get(player_id) {
+                let ctx = player.context_summary();
+                if !ctx.is_empty() {
+                    player_context.insert(name, ctx);
+                }
+            }
         }
     }
 
@@ -83,12 +103,17 @@ pub fn parse_trade(
         team_b_name: get_name(team_b_id),
         team_b_record: get_record(team_b_id),
         team_b_receives: receives.remove(&team_b_id).unwrap_or_default(),
+        player_ids,
+        player_context,
     })
 }
 
 /// Build the user message for the LLM prompt from a TradeSummary.
-pub fn build_prompt(summary: &TradeSummary) -> String {
-    let mut msg = String::from("Analyze this fantasy football trade:\n\nTRADE:\n");
+/// Optionally includes news snippets fetched for players.
+pub fn build_prompt(summary: &TradeSummary, player_news: &HashMap<String, String>) -> String {
+    let today = chrono::Local::now().format("%B %d, %Y");
+    let mut msg =
+        format!("Today's date: {today}\n\nAnalyze this fantasy football trade:\n\nTRADE:\n");
 
     msg.push_str(&format!(
         "{} (Record: {}) receives:\n",
@@ -115,8 +140,30 @@ pub fn build_prompt(summary: &TradeSummary) -> String {
         }
     }
 
-    msg.push_str("\nThis is a dynasty league. Factor in each player's age, injury history, contract situation, recent NFL news (signings, cuts, retirement buzz, depth chart changes), and long-term outlook. Who won this trade and why?");
+    // Add player metadata from Sleeper
+    if !summary.player_context.is_empty() {
+        msg.push_str("\nPLAYER DETAILS (from Sleeper):\n");
+        for (name, context) in &summary.player_context {
+            msg.push_str(&format!("  {name}: {context}\n"));
+        }
+    }
+
+    // Add news snippets if available (keyed by player display name)
+    if !player_news.is_empty() {
+        msg.push_str("\nRECENT NEWS:\n");
+        for (name, news) in player_news {
+            msg.push_str(&format!("  {name}: {news}\n"));
+        }
+    }
+
+    msg.push_str("\nThis is a dynasty league. Use the player details and recent news above (if provided) along with your own knowledge. Factor in each player's age, injury history, contract situation, recent NFL context, and long-term outlook. Who won this trade and why?");
     msg
+}
+
+/// Build the user message for the LLM prompt, without news (backwards-compatible).
+#[allow(dead_code)]
+pub fn build_prompt_simple(summary: &TradeSummary) -> String {
+    build_prompt(summary, &HashMap::new())
 }
 
 #[cfg(test)]
@@ -134,6 +181,7 @@ mod tests {
                 last_name: Some("Waddle".to_string()),
                 position: Some("WR".to_string()),
                 team: Some("MIA".to_string()),
+                ..Default::default()
             },
         );
         m.insert(
@@ -144,6 +192,7 @@ mod tests {
                 last_name: Some("Henry".to_string()),
                 position: Some("RB".to_string()),
                 team: Some("TEN".to_string()),
+                ..Default::default()
             },
         );
         m
@@ -227,9 +276,11 @@ mod tests {
                 "Player B (RB - DAL)".to_string(),
                 "2025 Round 1 Pick".to_string(),
             ],
+            player_ids: vec![],
+            player_context: HashMap::new(),
         };
 
-        let prompt = build_prompt(&summary);
+        let prompt = build_prompt(&summary, &HashMap::new());
         assert!(prompt.contains("Alice (Record: 5-5) receives:"));
         assert!(prompt.contains("Bob (Record: 7-3) receives:"));
         assert!(prompt.contains("Player A (WR - NYG)"));

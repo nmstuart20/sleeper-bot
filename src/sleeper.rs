@@ -202,8 +202,8 @@ impl SleeperClient {
     }
 
     pub async fn load_players(&mut self) -> Result<&HashMap<String, Player>> {
-        if self.players.is_some() {
-            return Ok(self.players.as_ref().unwrap());
+        if let Some(ref players) = self.players {
+            return Ok(players);
         }
 
         let cache_path = Path::new(PLAYER_CACHE_FILE);

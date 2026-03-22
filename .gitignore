@@ -1,0 +1,5 @@
+/target
+.env
+.sleeper_token
+.reviewed_trades.json
+players_cache.json

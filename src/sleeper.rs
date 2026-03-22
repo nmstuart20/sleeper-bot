@@ -1,0 +1,489 @@
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+const BASE_URL: &str = "https://api.sleeper.app/v1";
+const PLAYER_CACHE_FILE: &str = "players_cache.json";
+const CACHE_MAX_AGE_DAYS: i64 = 7;
+
+// ─── Data Models ───
+
+#[derive(Debug, Deserialize)]
+pub struct NflState {
+    pub week: u32,
+    pub season: String,
+    pub season_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct User {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub metadata: Option<UserMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserMetadata {
+    pub team_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct Roster {
+    pub roster_id: u32,
+    pub owner_id: Option<String>,
+    pub players: Option<Vec<String>>,
+    pub starters: Option<Vec<String>>,
+    pub settings: Option<RosterSettings>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct RosterSettings {
+    pub wins: Option<u32>,
+    pub losses: Option<u32>,
+    pub fpts: Option<u64>,
+    pub fpts_decimal: Option<u64>,
+}
+
+impl RosterSettings {
+    pub fn record(&self) -> String {
+        let w = self.wins.unwrap_or(0);
+        let l = self.losses.unwrap_or(0);
+        format!("{w}-{l}")
+    }
+
+    #[allow(dead_code)]
+    pub fn total_points(&self) -> f64 {
+        let fpts = self.fpts.unwrap_or(0) as f64;
+        let dec = self.fpts_decimal.unwrap_or(0) as f64;
+        fpts + dec / 100.0
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct Transaction {
+    #[serde(rename = "type")]
+    pub tx_type: Option<String>,
+    pub transaction_id: Option<String>,
+    pub status: Option<String>,
+    pub roster_ids: Option<Vec<u32>>,
+    pub adds: Option<HashMap<String, u32>>,
+    pub drops: Option<HashMap<String, u32>>,
+    pub draft_picks: Option<Vec<DraftPick>>,
+    pub created: Option<u64>,
+    pub status_updated: Option<u64>,
+}
+
+impl Transaction {
+    pub fn is_completed_trade(&self) -> bool {
+        self.tx_type.as_deref() == Some("trade") && self.status.as_deref() == Some("complete")
+    }
+
+    pub fn id(&self) -> &str {
+        self.transaction_id.as_deref().unwrap_or("unknown")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct DraftPick {
+    pub season: Option<String>,
+    pub round: Option<u32>,
+    pub roster_id: Option<u32>,
+    pub previous_owner_id: Option<u32>,
+    pub owner_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Player {
+    #[serde(default)]
+    pub player_id: Option<String>,
+    #[serde(default)]
+    pub first_name: Option<String>,
+    #[serde(default)]
+    pub last_name: Option<String>,
+    #[serde(default)]
+    pub position: Option<String>,
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+impl Player {
+    pub fn full_name(&self) -> String {
+        let first = self.first_name.as_deref().unwrap_or("");
+        let last = self.last_name.as_deref().unwrap_or("");
+        format!("{first} {last}").trim().to_string()
+    }
+}
+
+// ─── Client ───
+
+pub struct SleeperClient {
+    client: reqwest::Client,
+    players: Option<HashMap<String, Player>>,
+}
+
+impl SleeperClient {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            players: None,
+        }
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("HTTP request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {status} from {url}: {body}");
+        }
+        resp.json::<T>().await.context("Failed to parse JSON")
+    }
+
+    async fn get_json_with_retry<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        match self.get_json(url).await {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                self.get_json(url).await
+            }
+        }
+    }
+
+    pub async fn get_nfl_state(&self) -> Result<NflState> {
+        self.get_json_with_retry(&format!("{BASE_URL}/state/nfl"))
+            .await
+    }
+
+    pub async fn get_users(&self, league_id: &str) -> Result<Vec<User>> {
+        self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/users"))
+            .await
+    }
+
+    pub async fn get_rosters(&self, league_id: &str) -> Result<Vec<Roster>> {
+        self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/rosters"))
+            .await
+    }
+
+    pub async fn get_transactions(&self, league_id: &str, week: u32) -> Result<Vec<Transaction>> {
+        self.get_json_with_retry(&format!(
+            "{BASE_URL}/league/{league_id}/transactions/{week}"
+        ))
+        .await
+    }
+
+    /// Fetch transactions across all weeks (0 through max_week).
+    /// Dynasty/offseason trades can land on any week number, so we scan them all.
+    pub async fn get_all_transactions(
+        &self,
+        league_id: &str,
+        max_week: u32,
+    ) -> Result<Vec<Transaction>> {
+        let mut all = Vec::new();
+        for week in 0..=max_week {
+            match self.get_transactions(league_id, week).await {
+                Ok(txs) => all.extend(txs),
+                Err(e) => {
+                    // Week may simply have no endpoint (returns 404); skip it
+                    eprintln!("Warning: could not fetch week {week} transactions: {e}");
+                }
+            }
+        }
+        Ok(all)
+    }
+
+    pub async fn load_players(&mut self) -> Result<&HashMap<String, Player>> {
+        if self.players.is_some() {
+            return Ok(self.players.as_ref().unwrap());
+        }
+
+        let cache_path = Path::new(PLAYER_CACHE_FILE);
+        let should_fetch = if cache_path.exists() {
+            let metadata = std::fs::metadata(cache_path)?;
+            let modified = metadata.modified()?;
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            age.as_secs() > (CACHE_MAX_AGE_DAYS * 86400) as u64
+        } else {
+            true
+        };
+
+        if should_fetch {
+            println!("Fetching NFL players (this may take a moment)...");
+            let players: HashMap<String, Player> =
+                match self.get_json(&format!("{BASE_URL}/players/nfl")).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // If cache exists but is stale, try using it anyway
+                        if cache_path.exists() {
+                            eprintln!(
+                            "Warning: failed to fetch fresh player data ({e}), using stale cache"
+                        );
+                            let data = std::fs::read_to_string(cache_path)?;
+                            serde_json::from_str(&data).context("Corrupt player cache")?
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
+            // Write cache
+            if let Ok(json) = serde_json::to_string(&players) {
+                let _ = std::fs::write(cache_path, json);
+            }
+            self.players = Some(players);
+        } else {
+            let data = match std::fs::read_to_string(cache_path) {
+                Ok(d) => d,
+                Err(_) => {
+                    // Cache unreadable, delete and refetch
+                    let _ = std::fs::remove_file(cache_path);
+                    return Box::pin(self.load_players()).await;
+                }
+            };
+            let players: HashMap<String, Player> = match serde_json::from_str(&data) {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("Warning: corrupt player cache, re-fetching...");
+                    let _ = std::fs::remove_file(cache_path);
+                    return Box::pin(self.load_players()).await;
+                }
+            };
+            self.players = Some(players);
+        }
+
+        Ok(self.players.as_ref().unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub fn get_cached_players(&self) -> Option<&HashMap<String, Player>> {
+        self.players.as_ref()
+    }
+}
+
+// ─── Helpers ───
+
+/// Build a map of roster_id → display name (e.g. "Nick (Touchdown Tyrants)")
+pub fn build_roster_name_map(users: &[User], rosters: &[Roster]) -> HashMap<u32, String> {
+    let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
+
+    rosters
+        .iter()
+        .filter_map(|r| {
+            let owner_id = r.owner_id.as_deref()?;
+            let user = user_map.get(owner_id)?;
+            let display = user.display_name.as_deref().unwrap_or("Unknown");
+            let name = if let Some(ref meta) = user.metadata {
+                if let Some(ref team) = meta.team_name {
+                    if !team.is_empty() {
+                        format!("{display} ({team})")
+                    } else {
+                        display.to_string()
+                    }
+                } else {
+                    display.to_string()
+                }
+            } else {
+                display.to_string()
+            };
+            Some((r.roster_id, name))
+        })
+        .collect()
+}
+
+/// Build a map of roster_id → record string
+pub fn build_roster_record_map(rosters: &[Roster]) -> HashMap<u32, String> {
+    rosters
+        .iter()
+        .map(|r| {
+            let record = r
+                .settings
+                .as_ref()
+                .map(|s| s.record())
+                .unwrap_or_else(|| "0-0".to_string());
+            (r.roster_id, record)
+        })
+        .collect()
+}
+
+/// Format a player name from ID. Detects D/ST (short all-caps IDs like "DET").
+pub fn format_player_name(player_id: &str, players: &HashMap<String, Player>) -> String {
+    // Detect D/ST: short string, all uppercase letters
+    if player_id.len() <= 4 && player_id.chars().all(|c| c.is_ascii_uppercase()) {
+        return format!("{player_id} D/ST");
+    }
+
+    match players.get(player_id) {
+        Some(player) => {
+            let name = player.full_name();
+            let pos = player.position.as_deref().unwrap_or("??");
+            let team = player.team.as_deref().unwrap_or("FA");
+            if name.is_empty() {
+                format!("Unknown ({pos} - {team})")
+            } else {
+                format!("{name} ({pos} - {team})")
+            }
+        }
+        None => format!("Unknown Player ({player_id})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transaction_deserialization() {
+        let json = r#"{
+            "type": "trade",
+            "transaction_id": "434852362033561600",
+            "status": "complete",
+            "roster_ids": [2, 1],
+            "adds": { "4035": 1, "2257": 2 },
+            "drops": { "4035": 2, "2257": 1 },
+            "draft_picks": [
+                {
+                    "season": "2025",
+                    "round": 3,
+                    "roster_id": 2,
+                    "previous_owner_id": 2,
+                    "owner_id": 1
+                }
+            ],
+            "created": 1558039391576,
+            "status_updated": 1558039402803
+        }"#;
+
+        let tx: Transaction = serde_json::from_str(json).unwrap();
+        assert!(tx.is_completed_trade());
+        assert_eq!(tx.id(), "434852362033561600");
+        assert_eq!(tx.roster_ids.as_ref().unwrap().len(), 2);
+
+        let adds = tx.adds.as_ref().unwrap();
+        assert_eq!(adds.get("4035"), Some(&1));
+        assert_eq!(adds.get("2257"), Some(&2));
+
+        let picks = tx.draft_picks.as_ref().unwrap();
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].round, Some(3));
+        assert_eq!(picks[0].owner_id, Some(1));
+    }
+
+    #[test]
+    fn test_draft_pick_only_trade() {
+        let json = r#"{
+            "type": "trade",
+            "transaction_id": "123",
+            "status": "complete",
+            "roster_ids": [1, 2],
+            "adds": null,
+            "drops": null,
+            "draft_picks": [
+                {
+                    "season": "2025",
+                    "round": 1,
+                    "roster_id": 1,
+                    "previous_owner_id": 1,
+                    "owner_id": 2
+                }
+            ],
+            "created": 1558039391576
+        }"#;
+
+        let tx: Transaction = serde_json::from_str(json).unwrap();
+        assert!(tx.is_completed_trade());
+        assert!(tx.adds.is_none());
+        assert!(tx.drops.is_none());
+    }
+
+    #[test]
+    fn test_format_player_name_regular() {
+        let mut players = HashMap::new();
+        players.insert(
+            "4035".to_string(),
+            Player {
+                player_id: Some("4035".to_string()),
+                first_name: Some("Jaylen".to_string()),
+                last_name: Some("Waddle".to_string()),
+                position: Some("WR".to_string()),
+                team: Some("MIA".to_string()),
+            },
+        );
+
+        assert_eq!(
+            format_player_name("4035", &players),
+            "Jaylen Waddle (WR - MIA)"
+        );
+    }
+
+    #[test]
+    fn test_format_player_name_dst() {
+        let players = HashMap::new();
+        assert_eq!(format_player_name("DET", &players), "DET D/ST");
+        assert_eq!(format_player_name("PHI", &players), "PHI D/ST");
+    }
+
+    #[test]
+    fn test_format_player_name_unknown() {
+        let players = HashMap::new();
+        assert_eq!(
+            format_player_name("99999", &players),
+            "Unknown Player (99999)"
+        );
+    }
+
+    #[test]
+    fn test_roster_settings_record() {
+        let settings = RosterSettings {
+            wins: Some(8),
+            losses: Some(2),
+            fpts: Some(1234),
+            fpts_decimal: Some(56),
+        };
+        assert_eq!(settings.record(), "8-2");
+        assert!((settings.total_points() - 1234.56).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_non_trade_filtered() {
+        let json = r#"{
+            "type": "waiver",
+            "transaction_id": "456",
+            "status": "complete",
+            "roster_ids": [1]
+        }"#;
+        let tx: Transaction = serde_json::from_str(json).unwrap();
+        assert!(!tx.is_completed_trade());
+    }
+
+    #[test]
+    fn test_pending_trade_filtered() {
+        let json = r#"{
+            "type": "trade",
+            "transaction_id": "789",
+            "status": "pending",
+            "roster_ids": [1, 2]
+        }"#;
+        let tx: Transaction = serde_json::from_str(json).unwrap();
+        assert!(!tx.is_completed_trade());
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_real_sleeper_api() {
+        // Uses a known public league for integration testing
+        let client = SleeperClient::new();
+        let state = client.get_nfl_state().await.unwrap();
+        assert!(!state.season.is_empty());
+        println!("NFL State: week={}, season={}", state.week, state.season);
+    }
+}

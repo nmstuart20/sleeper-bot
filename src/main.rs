@@ -216,8 +216,21 @@ async fn run_debug(login: bool, send: Option<String>, league: Option<String>) ->
 }
 
 async fn setup_graphql() -> Result<SleeperGraphql> {
-    let username = std::env::var("SLEEPER_USERNAME")
-        .map_err(|_| anyhow::anyhow!("SLEEPER_USERNAME not set"))?;
+    // Prefer a direct token (avoids CAPTCHA issues with login)
+    if let Ok(token) = std::env::var("SLEEPER_TOKEN") {
+        println!("Using SLEEPER_TOKEN for authentication.");
+        return Ok(SleeperGraphql::with_token(token));
+    }
+
+    // Fall back to username/password login
+    let username = std::env::var("SLEEPER_USERNAME").map_err(|_| {
+        anyhow::anyhow!(
+            "Neither SLEEPER_TOKEN nor SLEEPER_USERNAME is set.\n\
+            Set SLEEPER_TOKEN with your auth token from browser DevTools \
+            (sleeper.app → DevTools → Application → Local Storage → look for token), \
+            or set SLEEPER_USERNAME + SLEEPER_PASSWORD to log in via GraphQL."
+        )
+    })?;
     let password = std::env::var("SLEEPER_PASSWORD")
         .map_err(|_| anyhow::anyhow!("SLEEPER_PASSWORD not set"))?;
 

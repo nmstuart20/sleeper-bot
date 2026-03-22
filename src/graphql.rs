@@ -6,23 +6,35 @@ const GRAPHQL_URL: &str = "https://sleeper.com/graphql";
 const TOKEN_FILE: &str = ".sleeper_token";
 const TOKEN_MAX_AGE_HOURS: i64 = 24;
 
-// These mutation strings are approximate — the Sleeper GraphQL API is undocumented.
-// Confirm exact shapes via browser DevTools (Network tab → filter "graphql" on sleeper.com).
-const LOGIN_MUTATION: &str = r#"mutation login($email_hash: String!, $password: String!) {
-  login(email_hash: $email_hash, password: $password) {
+const LOGIN_QUERY: &str = r#"query login_query($email_or_phone_or_username: String!, $password: String) {
+  login(email_or_phone_or_username: $email_or_phone_or_username, password: $password) {
     token
+    avatar
+    cookies
+    created
+    display_name
+    real_name
+    email
+    notifications
+    phone
     user_id
+    verification
+    data_updated
   }
 }"#;
 
-const SEND_MESSAGE_MUTATION: &str = r#"mutation send_message($league_id: String!, $message: String!) {
-  send_message(league_id: $league_id, message: $message) {
+const CREATE_MESSAGE_MUTATION: &str = r#"mutation create_message($text: String!, $parent_type: String!, $parent_id: Snowflake!) {
+  create_message(text: $text, parent_type: $parent_type, parent_id: $parent_id) {
     message_id
+    author_display_name
+    created
   }
 }"#;
 
 #[derive(Serialize)]
 struct GraphqlRequest {
+    #[serde(rename = "operationName")]
+    operation_name: &'static str,
     query: &'static str,
     variables: serde_json::Value,
 }
@@ -39,10 +51,13 @@ struct LoginData {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct LoginResult {
     token: Option<String>,
-    #[allow(dead_code)]
     user_id: Option<String>,
+    display_name: Option<String>,
+    avatar: Option<String>,
+    email: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +95,17 @@ impl SleeperGraphql {
         }
     }
 
+    /// Create a client with a pre-existing token, skipping login entirely.
+    /// Use this when you have a token from browser DevTools.
+    pub fn with_token(token: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            token: Some(token),
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+
     fn load_cached_token() -> Option<String> {
         let path = Path::new(TOKEN_FILE);
         if !path.exists() {
@@ -112,9 +138,10 @@ impl SleeperGraphql {
         }
 
         let req = GraphqlRequest {
-            query: LOGIN_MUTATION,
+            operation_name: "login_query",
+            query: LOGIN_QUERY,
             variables: serde_json::json!({
-                "email_hash": self.username,
+                "email_or_phone_or_username": self.username,
                 "password": self.password,
             }),
         };
@@ -122,6 +149,8 @@ impl SleeperGraphql {
         let resp = self
             .client
             .post(GRAPHQL_URL)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
             .json(&req)
             .send()
             .await
@@ -132,8 +161,7 @@ impl SleeperGraphql {
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!(
                 "Sleeper login failed (HTTP {status}): {body}\n\
-                Check SLEEPER_USERNAME and SLEEPER_PASSWORD. \
-                Note: the GraphQL API is undocumented and may change."
+                Check SLEEPER_USERNAME and SLEEPER_PASSWORD."
             );
         }
 
@@ -146,8 +174,7 @@ impl SleeperGraphql {
             let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
             anyhow::bail!(
                 "Sleeper login error: {}\n\
-                Check SLEEPER_USERNAME and SLEEPER_PASSWORD. \
-                Note: the GraphQL API is undocumented and may change.",
+                Check SLEEPER_USERNAME and SLEEPER_PASSWORD.",
                 msgs.join(", ")
             );
         }
@@ -158,8 +185,7 @@ impl SleeperGraphql {
             .and_then(|l| l.token)
             .context(
                 "No token in login response. \
-                Check SLEEPER_USERNAME and SLEEPER_PASSWORD. \
-                Note: the GraphQL API is undocumented and may change.",
+                Check SLEEPER_USERNAME and SLEEPER_PASSWORD.",
             )?;
 
         Self::save_token(&token);
@@ -175,17 +201,21 @@ impl SleeperGraphql {
             .clone();
 
         let req = GraphqlRequest {
-            query: SEND_MESSAGE_MUTATION,
+            operation_name: "create_message",
+            query: CREATE_MESSAGE_MUTATION,
             variables: serde_json::json!({
-                "league_id": league_id,
-                "message": message,
+                "text": message,
+                "parent_type": "league",
+                "parent_id": league_id,
             }),
         };
 
         let resp = self
             .client
             .post(GRAPHQL_URL)
-            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("Authorization", token.to_string())
             .json(&req)
             .send()
             .await
@@ -209,7 +239,7 @@ impl SleeperGraphql {
         let msg_resp: SendMessageResponse = resp
             .json()
             .await
-            .context("Failed to parse send_message response")?;
+            .context("Failed to parse create_message response")?;
 
         if let Some(errors) = msg_resp.errors {
             let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();

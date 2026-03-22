@@ -93,7 +93,9 @@ fn extract_rss_titles(xml: &str) -> Vec<String> {
         if let Some(title_start) = item_body.find("<title>") {
             let after_tag = &item_body[title_start + 7..];
             if let Some(title_end) = after_tag.find("</title>") {
-                let title = decode_xml_entities(&after_tag[..title_end]).trim().to_string();
+                let title = decode_xml_entities(&after_tag[..title_end])
+                    .trim()
+                    .to_string();
                 if !title.is_empty() {
                     titles.push(title);
                 }

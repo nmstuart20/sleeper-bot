@@ -207,7 +207,9 @@ async fn run_debug(login: bool, send: Option<String>, league: Option<String>) ->
         gql.send_message(&league_id, &msg).await?;
         println!("Message sent successfully!");
     } else {
-        println!("Use --login to test authentication, --send <msg> --league <id> to send a test message.");
+        println!(
+            "Use --login to test authentication, --send <msg> --league <id> to send a test message."
+        );
     }
     Ok(())
 }
@@ -301,7 +303,7 @@ async fn process_trades(
 
         println!("\n{analysis}\n");
 
-        if let Some(ref mut graphql) = gql {
+        if let Some(graphql) = gql {
             println!("Posting to league chat...");
             match graphql.send_message(league_id, &analysis).await {
                 Ok(()) => {

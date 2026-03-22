@@ -193,20 +193,26 @@ mod tests {
         // Team A is roster 2 (first in roster_ids)
         assert_eq!(summary.team_a_name, "Mike (Dumpster Fire)");
         assert_eq!(summary.team_a_record, "3-7");
-        assert!(summary
-            .team_a_receives
-            .iter()
-            .any(|s| s.contains("Derrick Henry")));
+        assert!(
+            summary
+                .team_a_receives
+                .iter()
+                .any(|s| s.contains("Derrick Henry"))
+        );
 
         assert_eq!(summary.team_b_name, "Nick (Touchdown Tyrants)");
-        assert!(summary
-            .team_b_receives
-            .iter()
-            .any(|s| s.contains("Jaylen Waddle")));
-        assert!(summary
-            .team_b_receives
-            .iter()
-            .any(|s| s.contains("Round 3")));
+        assert!(
+            summary
+                .team_b_receives
+                .iter()
+                .any(|s| s.contains("Jaylen Waddle"))
+        );
+        assert!(
+            summary
+                .team_b_receives
+                .iter()
+                .any(|s| s.contains("Round 3"))
+        );
     }
 
     #[test]

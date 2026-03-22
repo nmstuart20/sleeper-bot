@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{TradeAnalyzer, SYSTEM_PROMPT};
+use crate::llm::{SYSTEM_PROMPT, TradeAnalyzer};
 
 const MODEL: &str = "gemini-2.5-flash";
 

@@ -220,22 +220,24 @@ impl SleeperClient {
 
         if should_fetch {
             println!("Fetching NFL players (this may take a moment)...");
-            let players: HashMap<String, Player> =
-                match self.get_json(&format!("{BASE_URL}/players/nfl")).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        // If cache exists but is stale, try using it anyway
-                        if cache_path.exists() {
-                            eprintln!(
+            let players: HashMap<String, Player> = match self
+                .get_json(&format!("{BASE_URL}/players/nfl"))
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    // If cache exists but is stale, try using it anyway
+                    if cache_path.exists() {
+                        eprintln!(
                             "Warning: failed to fetch fresh player data ({e}), using stale cache"
                         );
-                            let data = std::fs::read_to_string(cache_path)?;
-                            serde_json::from_str(&data).context("Corrupt player cache")?
-                        } else {
-                            return Err(e);
-                        }
+                        let data = std::fs::read_to_string(cache_path)?;
+                        serde_json::from_str(&data).context("Corrupt player cache")?
+                    } else {
+                        return Err(e);
                     }
-                };
+                }
+            };
             // Write cache
             if let Ok(json) = serde_json::to_string(&players) {
                 let _ = std::fs::write(cache_path, json);

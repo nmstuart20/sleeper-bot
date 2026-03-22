@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{TradeAnalyzer, SYSTEM_PROMPT};
+use crate::llm::{SYSTEM_PROMPT, TradeAnalyzer};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODEL: &str = "claude-sonnet-4-20250514";

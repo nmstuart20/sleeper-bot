@@ -123,7 +123,7 @@ fn urlenccode_char(c: char, out: &mut String) {
     }
 }
 
-fn urlencode(s: &str) -> String {
+pub fn urlencode(s: &str) -> String {
     let mut result = String::with_capacity(s.len() * 2);
     for c in s.chars() {
         urlenccode_char(c, &mut result);

@@ -77,92 +77,108 @@ impl GeminiClient {
     }
 }
 
+impl GeminiClient {
+    async fn call_gemini(&self, system: &str, user: &str) -> Result<String> {
+        let body = Request {
+            system_instruction: SystemInstruction {
+                parts: vec![Part {
+                    text: system.to_string(),
+                }],
+            },
+            contents: vec![Content {
+                role: "user",
+                parts: vec![Part {
+                    text: user.to_string(),
+                }],
+            }],
+            generation_config: GenerationConfig {
+                max_output_tokens: 3000,
+            },
+        };
+
+        let mut last_err = None;
+        let backoffs = [1, 2, 4];
+
+        for (attempt, &delay) in std::iter::once(&0).chain(backoffs.iter()).enumerate() {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+
+            let result = self
+                .client
+                .post(self.api_url())
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        let response: Response = resp
+                            .json()
+                            .await
+                            .context("Failed to parse Gemini response")?;
+
+                        if let Some(err) = response.error {
+                            anyhow::bail!("Gemini API error: {}", err.message);
+                        }
+
+                        let text = response
+                            .candidates
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|c| c.content)
+                            .flat_map(|c| c.parts.unwrap_or_default())
+                            .map(|p| p.text)
+                            .collect::<Vec<_>>()
+                            .join("");
+
+                        if text.is_empty() {
+                            anyhow::bail!("Gemini returned empty response");
+                        }
+
+                        return Ok(text);
+                    }
+
+                    let code = status.as_u16();
+                    let body_text = resp.text().await.unwrap_or_default();
+
+                    if code == 429 || code >= 500 {
+                        last_err = Some(anyhow::anyhow!("HTTP {code}: {body_text}"));
+                        continue;
+                    }
+
+                    anyhow::bail!("Gemini API error {code}: {body_text}");
+                }
+                Err(e) => {
+                    last_err = Some(e.into());
+                    continue;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Gemini API failed after retries")))
+    }
+}
+
 impl TradeAnalyzer for GeminiClient {
     fn analyze_trade(
         &self,
         user_prompt: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
         let prompt = user_prompt.to_string();
-        Box::pin(async move {
-            let body = Request {
-                system_instruction: SystemInstruction {
-                    parts: vec![Part {
-                        text: SYSTEM_PROMPT.to_string(),
-                    }],
-                },
-                contents: vec![Content {
-                    role: "user",
-                    parts: vec![Part { text: prompt }],
-                }],
-                generation_config: GenerationConfig {
-                    max_output_tokens: 3000,
-                },
-            };
+        Box::pin(async move { self.call_gemini(SYSTEM_PROMPT, &prompt).await })
+    }
 
-            let mut last_err = None;
-            let backoffs = [1, 2, 4];
-
-            for (attempt, &delay) in std::iter::once(&0).chain(backoffs.iter()).enumerate() {
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                }
-
-                let result = self
-                    .client
-                    .post(self.api_url())
-                    .header("content-type", "application/json")
-                    .json(&body)
-                    .send()
-                    .await;
-
-                match result {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            let response: Response = resp
-                                .json()
-                                .await
-                                .context("Failed to parse Gemini response")?;
-
-                            if let Some(err) = response.error {
-                                anyhow::bail!("Gemini API error: {}", err.message);
-                            }
-
-                            let text = response
-                                .candidates
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter_map(|c| c.content)
-                                .flat_map(|c| c.parts.unwrap_or_default())
-                                .map(|p| p.text)
-                                .collect::<Vec<_>>()
-                                .join("");
-
-                            if text.is_empty() {
-                                anyhow::bail!("Gemini returned empty response");
-                            }
-
-                            return Ok(text);
-                        }
-
-                        let code = status.as_u16();
-                        let body_text = resp.text().await.unwrap_or_default();
-
-                        if code == 429 || code >= 500 {
-                            last_err = Some(anyhow::anyhow!("HTTP {code}: {body_text}"));
-                            continue;
-                        }
-
-                        anyhow::bail!("Gemini API error {code}: {body_text}");
-                    }
-                    Err(e) => {
-                        last_err = Some(e.into());
-                        continue;
-                    }
-                }
-            }
-
-            Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Gemini API failed after retries")))
-        })
+    fn generate(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
+        let system = system_prompt.to_string();
+        let user = user_prompt.to_string();
+        Box::pin(async move { self.call_gemini(&system, &user).await })
     }
 }

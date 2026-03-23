@@ -14,6 +14,16 @@ const CREATE_MESSAGE_MUTATION: &str = r#"mutation create_message($text: String!,
   }
 }"#;
 
+const GET_MESSAGES_QUERY: &str = r#"query get_messages($parent_type: String!, $parent_id: Snowflake!, $message_id: Snowflake) {
+  get_messages(parent_type: $parent_type, parent_id: $parent_id, message_id: $message_id) {
+    message_id
+    author_id
+    author_display_name
+    text
+    created
+  }
+}"#;
+
 #[derive(Serialize)]
 struct GraphqlRequest {
     #[serde(rename = "operationName")]
@@ -34,10 +44,33 @@ struct GraphqlError {
     message: String,
 }
 
+/// A chat message fetched from a league channel.
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatMessage {
+    pub message_id: Option<String>,
+    pub author_id: Option<String>,
+    pub author_display_name: Option<String>,
+    pub text: Option<String>,
+    pub created: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GetMessagesResponse {
+    data: Option<GetMessagesData>,
+    errors: Option<Vec<GraphqlError>>,
+}
+
+#[derive(Deserialize)]
+struct GetMessagesData {
+    get_messages: Option<Vec<ChatMessage>>,
+}
+
 /// JWT claims we care about for expiry checking.
 #[derive(Deserialize)]
 struct JwtClaims {
     exp: Option<i64>,
+    user_id: Option<String>,
 }
 
 pub struct SleeperGraphql {
@@ -144,14 +177,76 @@ impl SleeperGraphql {
         Ok(())
     }
 
+    /// Fetch recent messages from a league chat.
+    /// If `after_message_id` is provided, fetches messages after that cursor.
+    pub async fn fetch_messages(
+        &self,
+        league_id: &str,
+        after_message_id: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let mut variables = serde_json::json!({
+            "parent_type": "league",
+            "parent_id": league_id,
+        });
+
+        if let Some(msg_id) = after_message_id {
+            variables["message_id"] = serde_json::Value::String(msg_id.to_string());
+        }
+
+        let req = serde_json::json!({
+            "operationName": "get_messages",
+            "query": GET_MESSAGES_QUERY,
+            "variables": variables,
+        });
+
+        let resp = self
+            .client
+            .post(GRAPHQL_URL)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("Authorization", &self.token)
+            .json(&req)
+            .send()
+            .await
+            .context("Failed to fetch messages from Sleeper")?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!("Sleeper returned 401 Unauthorized fetching messages.");
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to fetch messages (HTTP {status}): {body}");
+        }
+
+        let msg_resp: GetMessagesResponse = resp
+            .json()
+            .await
+            .context("Failed to parse get_messages response")?;
+
+        if let Some(errors) = msg_resp.errors {
+            let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+            anyhow::bail!("GraphQL error fetching messages: {}", msgs.join(", "));
+        }
+
+        Ok(msg_resp
+            .data
+            .and_then(|d| d.get_messages)
+            .unwrap_or_default())
+    }
+
+    /// Extract the bot's user_id from the JWT token.
+    pub fn bot_user_id(&self) -> Option<String> {
+        decode_jwt_user_id(&self.token).ok().flatten()
+    }
+
     pub fn is_authenticated(&self) -> bool {
         !self.token.is_empty()
     }
 }
 
-/// Decode the expiry timestamp from a JWT without verifying the signature.
-/// Returns Ok(Some(exp_timestamp)) or Ok(None) if the exp claim is missing.
-fn decode_jwt_expiry(token: &str) -> Result<Option<i64>> {
+/// Decode JWT claims without verifying the signature.
+fn decode_jwt_claims(token: &str) -> Result<JwtClaims> {
     use base64::prelude::*;
 
     let parts: Vec<&str> = token.split('.').collect();
@@ -159,15 +254,21 @@ fn decode_jwt_expiry(token: &str) -> Result<Option<i64>> {
         anyhow::bail!("Invalid JWT format (expected 3 parts, got {})", parts.len());
     }
 
-    // Decode the payload (second part) — JWT uses base64url without padding
     let payload_bytes = BASE64_URL_SAFE_NO_PAD
         .decode(parts[1])
         .context("Failed to base64-decode JWT payload")?;
 
-    let claims: JwtClaims =
-        serde_json::from_slice(&payload_bytes).context("Failed to parse JWT claims")?;
+    serde_json::from_slice(&payload_bytes).context("Failed to parse JWT claims")
+}
 
-    Ok(claims.exp)
+/// Decode the expiry timestamp from a JWT without verifying the signature.
+fn decode_jwt_expiry(token: &str) -> Result<Option<i64>> {
+    Ok(decode_jwt_claims(token)?.exp)
+}
+
+/// Decode the user_id from a JWT without verifying the signature.
+fn decode_jwt_user_id(token: &str) -> Result<Option<String>> {
+    Ok(decode_jwt_claims(token)?.user_id)
 }
 
 #[cfg(test)]

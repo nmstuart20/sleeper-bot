@@ -1,4 +1,5 @@
 mod anthropic;
+mod chat;
 mod gemini;
 mod graphql;
 mod llm;
@@ -16,7 +17,7 @@ use crate::gemini::GeminiClient;
 use crate::graphql::SleeperGraphql;
 use crate::llm::TradeAnalyzer;
 use crate::sleeper::{Player, SleeperClient};
-use crate::state::ReviewState;
+use crate::state::{ChatState, ReviewState};
 
 #[derive(Clone, ValueEnum)]
 enum LlmProvider {
@@ -38,21 +39,24 @@ enum Cli {
         #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
         provider: LlmProvider,
         /// Only process trades from the last N days
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "3")]
         days: u64,
     },
-    /// Watch for trades continuously with polling
+    /// Watch for trades and chat @mentions continuously
     Watch {
         #[arg(long, env = "SLEEPER_LEAGUE_ID")]
         league: String,
-        /// Poll interval in seconds
+        /// Trade poll interval in seconds
         #[arg(long, default_value = "300")]
         interval: u64,
+        /// Chat poll interval in seconds
+        #[arg(long, default_value = "30")]
+        chat_interval: u64,
         /// LLM provider to use for analysis
         #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
         provider: LlmProvider,
         /// Only process trades from the last N days
-        #[arg(long, default_value = "2")]
+        #[arg(long, default_value = "3")]
         days: u64,
     },
     /// Debug the GraphQL connection
@@ -86,11 +90,12 @@ async fn main() -> Result<()> {
         Cli::Watch {
             league,
             interval,
+            chat_interval,
             provider,
             days,
         } => {
             let analyzer = build_analyzer(&provider)?;
-            run_watch(&league, interval, days, analyzer.as_ref()).await
+            run_watch(&league, interval, chat_interval, days, analyzer.as_ref()).await
         }
         Cli::Debug {
             check_token,
@@ -142,7 +147,7 @@ async fn run_check(
         league_id,
         &mut sleeper,
         analyzer,
-        &gql,
+        gql.as_ref(),
         &mut review_state,
         days,
     )
@@ -151,38 +156,160 @@ async fn run_check(
 
 async fn run_watch(
     league_id: &str,
-    interval: u64,
+    trade_interval: u64,
+    chat_interval: u64,
     days: u64,
     analyzer: &dyn TradeAnalyzer,
 ) -> Result<()> {
-    let mut sleeper = SleeperClient::new();
-    let mut review_state = ReviewState::load()?;
-
     let gql = match setup_graphql() {
-        Ok(g) => Some(g),
+        Ok(g) => g,
         Err(e) => {
-            eprintln!("Warning: GraphQL setup failed ({e}). Continuing in terminal-only mode.");
-            None
+            anyhow::bail!("GraphQL setup failed: {e}");
         }
     };
 
     println!(
-        "Watching league {league_id} for trades (polling every {interval}s). Press Ctrl+C to stop."
+        "Watching league {league_id} — trades every {trade_interval}s, chat every {chat_interval}s. Press Ctrl+C to stop."
     );
+
+    let trade_loop = trade_poll_loop(league_id, trade_interval, days, analyzer, &gql);
+    let chat_loop = chat_poll_loop(league_id, chat_interval, analyzer, &gql);
+
+    // Run both loops concurrently — if either returns an error, report it
+    tokio::select! {
+        result = trade_loop => {
+            if let Err(e) = result {
+                eprintln!("Trade watcher exited with error: {e}");
+            }
+        }
+        result = chat_loop => {
+            if let Err(e) = result {
+                eprintln!("Chat watcher exited with error: {e}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn trade_poll_loop(
+    league_id: &str,
+    interval: u64,
+    days: u64,
+    analyzer: &dyn TradeAnalyzer,
+    gql: &SleeperGraphql,
+) -> Result<()> {
+    let mut sleeper = SleeperClient::new();
+    let mut review_state = ReviewState::load()?;
 
     loop {
         if let Err(e) = process_trades(
             league_id,
             &mut sleeper,
             analyzer,
-            &gql,
+            Some(gql),
             &mut review_state,
             days,
         )
         .await
         {
-            eprintln!("Error during poll cycle: {e}");
+            eprintln!("Error during trade poll: {e}");
         }
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
+}
+
+async fn chat_poll_loop(
+    league_id: &str,
+    interval: u64,
+    analyzer: &dyn TradeAnalyzer,
+    gql: &SleeperGraphql,
+) -> Result<()> {
+    let bot_user_id = gql.bot_user_id();
+
+    if let Some(ref id) = bot_user_id {
+        println!("Bot user ID: {id}");
+    } else {
+        eprintln!(
+            "Warning: could not extract bot user_id from token. Bot may reply to its own messages."
+        );
+    }
+
+    let mut chat_state = ChatState::load()?;
+    let mut sleeper = SleeperClient::new();
+
+    // Pre-load league data
+    println!("Loading league data for chat...");
+    let users = sleeper.get_users(league_id).await?;
+    let rosters = sleeper.get_rosters(league_id).await?;
+    let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
+
+    let league_context = chat::build_league_context(&users, &rosters, &players);
+
+    loop {
+        match gql.fetch_messages(league_id, None).await {
+            Ok(messages) => {
+                for msg in &messages {
+                    let msg_id = match msg.message_id.as_deref() {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    if chat_state.has_responded(msg_id) {
+                        continue;
+                    }
+
+                    let text = msg.text.as_deref().unwrap_or("");
+
+                    // Skip messages from the bot itself
+                    if let (Some(bot_id), Some(author_id)) = (&bot_user_id, &msg.author_id)
+                        && bot_id == author_id {
+                            chat_state.mark_responded(msg_id)?;
+                            continue;
+                        }
+
+                    if !chat::is_mention(text) {
+                        continue;
+                    }
+
+                    let author = msg.author_display_name.as_deref().unwrap_or("Someone");
+                    let question = chat::strip_mention(text);
+
+                    println!("\nMention from {author}: \"{text}\"");
+
+                    println!("Searching for context...");
+                    let search_results = chat::search_for_context(&question).await;
+
+                    let prompt = chat::build_chat_prompt(
+                        author,
+                        &question,
+                        &league_context,
+                        &search_results,
+                    );
+
+                    println!("Generating response...");
+                    match analyzer.generate(llm::CHAT_SYSTEM_PROMPT, &prompt).await {
+                        Ok(response) => {
+                            println!("Response: {response}");
+                            match gql.send_message(league_id, &response).await {
+                                Ok(()) => println!("Posted reply to league chat!"),
+                                Err(e) => eprintln!("Failed to post reply: {e}"),
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to generate response: {e}");
+                        }
+                    }
+
+                    chat_state.mark_responded(msg_id)?;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error fetching messages: {e}");
+            }
+        }
+
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
     }
 }
@@ -229,7 +356,7 @@ async fn process_trades(
     league_id: &str,
     sleeper: &mut SleeperClient,
     analyzer: &dyn TradeAnalyzer,
-    gql: &Option<SleeperGraphql>,
+    gql: Option<&SleeperGraphql>,
     review_state: &mut ReviewState,
     days: u64,
 ) -> Result<()> {

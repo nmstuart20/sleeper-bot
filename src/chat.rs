@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::news;
-use crate::sleeper::{Player, Roster, User};
+use crate::sleeper::{AllTimeUserStats, Player, Roster, SeasonChampion, Transaction, User};
 
 const BOT_USERNAME: &str = "tradegimp210";
 
@@ -19,15 +19,19 @@ pub fn strip_mention(text: &str) -> String {
     result.trim().to_string()
 }
 
-/// Build a league context string with standings and roster info for the LLM.
+/// Build a league context string with standings, points, roster info, recent transactions, and history.
 pub fn build_league_context(
     users: &[User],
     rosters: &[Roster],
     players: &HashMap<String, Player>,
+    recent_transactions: &[Transaction],
+    roster_names: &HashMap<u32, String>,
+    champions: &[SeasonChampion],
+    all_time_stats: &[AllTimeUserStats],
 ) -> String {
     let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 
-    let mut standings: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut standings: Vec<(String, String, f64, f64, Vec<String>)> = Vec::new();
 
     for roster in rosters {
         let owner_id = match roster.owner_id.as_deref() {
@@ -50,11 +54,12 @@ pub fn build_league_context(
             display_name.to_string()
         };
 
-        let record = roster
-            .settings
-            .as_ref()
+        let settings = roster.settings.as_ref();
+        let record = settings
             .map(|s| s.record())
             .unwrap_or_else(|| "0-0".to_string());
+        let points = settings.map(|s| s.total_points()).unwrap_or(0.0);
+        let pts_against = settings.map(|s| s.points_against()).unwrap_or(0.0);
 
         // Get top starters
         let starters: Vec<String> = roster
@@ -74,31 +79,133 @@ pub fn build_league_context(
             })
             .unwrap_or_default();
 
-        standings.push((name, record, starters));
+        standings.push((name, record, points, pts_against, starters));
     }
 
-    // Sort by wins descending
+    // Sort by wins descending, then points as tiebreaker
     standings.sort_by(|a, b| {
-        let a_wins: u32 =
-            a.1.split('-')
-                .next()
-                .and_then(|w| w.parse().ok())
-                .unwrap_or(0);
-        let b_wins: u32 =
-            b.1.split('-')
-                .next()
-                .and_then(|w| w.parse().ok())
-                .unwrap_or(0);
-        b_wins.cmp(&a_wins)
+        let a_wins: u32 = a.1.split('-').next().and_then(|w| w.parse().ok()).unwrap_or(0);
+        let b_wins: u32 = b.1.split('-').next().and_then(|w| w.parse().ok()).unwrap_or(0);
+        b_wins.cmp(&a_wins).then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     let mut ctx = String::from("LEAGUE STANDINGS:\n");
-    for (name, record, starters) in &standings {
-        ctx.push_str(&format!("  {name} ({record})"));
+    for (i, (name, record, points, pts_against, starters)) in standings.iter().enumerate() {
+        ctx.push_str(&format!(
+            "  {}. {name} ({record}, {points:.1} PF, {pts_against:.1} PA)",
+            i + 1
+        ));
         if !starters.is_empty() {
             ctx.push_str(&format!(" - Key players: {}", starters.join(", ")));
         }
         ctx.push('\n');
+    }
+
+    // Recent transactions (last 10)
+    if !recent_transactions.is_empty() {
+        ctx.push_str("\nRECENT TRANSACTIONS:\n");
+        let cutoff_ms = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            now.saturating_sub(7 * 24 * 60 * 60 * 1000)
+        };
+
+        let mut shown = 0;
+        for tx in recent_transactions.iter().rev() {
+            if shown >= 10 {
+                break;
+            }
+            if tx.created.unwrap_or(0) < cutoff_ms {
+                continue;
+            }
+            let tx_type = tx.tx_type.as_deref().unwrap_or("unknown");
+            let team = tx
+                .roster_ids
+                .as_ref()
+                .and_then(|ids| ids.first())
+                .and_then(|id| roster_names.get(id))
+                .map(|s| s.as_str())
+                .unwrap_or("Unknown");
+
+            match tx_type {
+                "trade" => {
+                    let teams: Vec<&str> = tx
+                        .roster_ids
+                        .as_ref()
+                        .map(|ids| {
+                            ids.iter()
+                                .filter_map(|id| roster_names.get(id).map(|s| s.as_str()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    ctx.push_str(&format!("  Trade: {} completed a trade\n", teams.join(" and ")));
+                }
+                "waiver" | "free_agent" => {
+                    let adds: Vec<String> = tx
+                        .adds
+                        .as_ref()
+                        .map(|m| {
+                            m.keys()
+                                .filter_map(|pid| players.get(pid))
+                                .map(|p| p.full_name())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let drops: Vec<String> = tx
+                        .drops
+                        .as_ref()
+                        .map(|m| {
+                            m.keys()
+                                .filter_map(|pid| players.get(pid))
+                                .map(|p| p.full_name())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let mut line = format!("  {team}");
+                    if !adds.is_empty() {
+                        line.push_str(&format!(" added {}", adds.join(", ")));
+                    }
+                    if !drops.is_empty() {
+                        line.push_str(&format!(" dropped {}", drops.join(", ")));
+                    }
+                    ctx.push_str(&line);
+                    ctx.push('\n');
+                }
+                _ => {}
+            }
+            shown += 1;
+        }
+    }
+
+    // Historical champions
+    if !champions.is_empty() {
+        ctx.push_str("\nLEAGUE CHAMPIONS:\n");
+        for champ in champions {
+            ctx.push_str(&format!("  {} - {}\n", champ.season, champ.display_name));
+        }
+    }
+
+    // All-time stats
+    if !all_time_stats.is_empty() {
+        ctx.push_str("\nALL-TIME STATS:\n");
+        for s in all_time_stats {
+            let win_pct = if s.wins + s.losses > 0 {
+                s.wins as f64 / (s.wins + s.losses) as f64 * 100.0
+            } else {
+                0.0
+            };
+            let champ_str = if s.championships > 0 {
+                format!(", {} ring(s)", s.championships)
+            } else {
+                String::new()
+            };
+            ctx.push_str(&format!(
+                "  {} - {}-{} ({win_pct:.0}%), {:.1} PF, {:.1} PA{champ_str}\n",
+                s.display_name, s.wins, s.losses, s.points_for, s.points_against
+            ));
+        }
     }
 
     ctx
@@ -206,7 +313,7 @@ pub fn build_chat_prompt(
         prompt.push('\n');
     }
 
-    prompt.push_str("\nRespond to their message. Be helpful but stay in character as Jon Gruden. If they're asking about a specific player, team, or matchup, give your honest take.");
+    prompt.push_str("\nRespond to their message. Use the league data and search results above. If they're asking about a specific player, team, or matchup, give your honest take — don't hold back.");
     prompt
 }
 

@@ -47,10 +47,10 @@ enum Cli {
         #[arg(long, env = "SLEEPER_LEAGUE_ID")]
         league: String,
         /// Trade poll interval in seconds
-        #[arg(long, default_value = "300")]
+        #[arg(long, default_value = "20")]
         interval: u64,
         /// Chat poll interval in seconds
-        #[arg(long, default_value = "30")]
+        #[arg(long, default_value = "20")]
         chat_interval: u64,
         /// LLM provider to use for analysis
         #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
@@ -67,8 +67,14 @@ enum Cli {
         /// Send a test message to the league chat
         #[arg(long)]
         send: Option<String>,
+        /// Test the chat AI with a question (prints response, does not post)
+        #[arg(long)]
+        chat: Option<String>,
         #[arg(long, env = "SLEEPER_LEAGUE_ID")]
         league: Option<String>,
+        /// LLM provider to use for --chat test
+        #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
+        provider: LlmProvider,
     },
 }
 
@@ -100,8 +106,17 @@ async fn main() -> Result<()> {
         Cli::Debug {
             check_token,
             send,
+            chat,
             league,
-        } => run_debug(check_token, send, league).await,
+            provider,
+        } => {
+            let analyzer = if chat.is_some() {
+                Some(build_analyzer(&provider)?)
+            } else {
+                None
+            };
+            run_debug(check_token, send, chat, league, analyzer.as_deref()).await
+        }
     }
 }
 
@@ -243,8 +258,24 @@ async fn chat_poll_loop(
     let users = sleeper.get_users(league_id).await?;
     let rosters = sleeper.get_rosters(league_id).await?;
     let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
+    let roster_names = sleeper::build_roster_name_map(&users, &rosters);
 
-    let league_context = chat::build_league_context(&users, &rosters, &players);
+    let nfl_state = sleeper.get_nfl_state().await?;
+    let max_week = std::cmp::max(nfl_state.week, 1);
+    let recent_transactions = sleeper.get_all_transactions(league_id, max_week).await.unwrap_or_default();
+
+    println!("Loading league history...");
+    let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
+
+    let league_context = chat::build_league_context(
+        &users,
+        &rosters,
+        &players,
+        &recent_transactions,
+        &roster_names,
+        &champions,
+        &all_time_stats,
+    );
 
     loop {
         match gql.fetch_messages(league_id, None).await {
@@ -260,6 +291,12 @@ async fn chat_poll_loop(
                     }
 
                     let text = msg.text.as_deref().unwrap_or("");
+
+                    // Skip system-generated messages and bot messages
+                    if msg.author_is_bot.unwrap_or(false) {
+                        chat_state.mark_responded(msg_id)?;
+                        continue;
+                    }
 
                     // Skip messages from the bot itself
                     if let (Some(bot_id), Some(author_id)) = (&bot_user_id, &msg.author_id)
@@ -314,7 +351,13 @@ async fn chat_poll_loop(
     }
 }
 
-async fn run_debug(check_token: bool, send: Option<String>, league: Option<String>) -> Result<()> {
+async fn run_debug(
+    check_token: bool,
+    send: Option<String>,
+    chat_question: Option<String>,
+    league: Option<String>,
+    analyzer: Option<&dyn TradeAnalyzer>,
+) -> Result<()> {
     if check_token {
         println!("Checking SLEEPER_TOKEN...");
         let gql = setup_graphql()?;
@@ -325,6 +368,46 @@ async fn run_debug(check_token: bool, send: Option<String>, league: Option<Strin
             gql.send_message(&league_id, &msg).await?;
             println!("Message sent successfully!");
         }
+    } else if let Some(question) = chat_question {
+        let league_id = league.ok_or_else(|| anyhow::anyhow!("--league required with --chat"))?;
+        let analyzer = analyzer.ok_or_else(|| anyhow::anyhow!("analyzer not initialized"))?;
+
+        println!("Loading league data...");
+        let mut sleeper = SleeperClient::new();
+        let users = sleeper.get_users(&league_id).await?;
+        let rosters = sleeper.get_rosters(&league_id).await?;
+        let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
+        let roster_names = sleeper::build_roster_name_map(&users, &rosters);
+
+        let nfl_state = sleeper.get_nfl_state().await?;
+        let max_week = std::cmp::max(nfl_state.week, 1);
+        let recent_transactions = sleeper.get_all_transactions(&league_id, max_week).await.unwrap_or_default();
+
+        println!("Loading league history...");
+        let (champions, all_time_stats) = sleeper.fetch_league_history(&league_id).await;
+
+        let league_context = chat::build_league_context(
+            &users,
+            &rosters,
+            &players,
+            &recent_transactions,
+            &roster_names,
+            &champions,
+            &all_time_stats,
+        );
+
+        println!("\n--- League Context ---\n{league_context}\n---\n");
+        println!("Searching for context on: \"{question}\"");
+        let search_results = chat::search_for_context(&question).await;
+        if !search_results.is_empty() {
+            println!("Search results found.\n");
+        }
+
+        let prompt = chat::build_chat_prompt("debug_user", &question, &league_context, &search_results);
+
+        println!("Generating response...");
+        let response = analyzer.generate(llm::CHAT_SYSTEM_PROMPT, &prompt).await?;
+        println!("\n--- Chat Response ---\n{response}\n---");
     } else if let Some(msg) = send {
         let league_id = league.ok_or_else(|| anyhow::anyhow!("--league required with --send"))?;
         let gql = setup_graphql()?;
@@ -333,7 +416,7 @@ async fn run_debug(check_token: bool, send: Option<String>, league: Option<Strin
         println!("Message sent successfully!");
     } else {
         println!(
-            "Use --check-token to verify your token, --send <msg> --league <id> to send a test message."
+            "Use --check-token to verify your token, --send <msg> --league <id> to send a test message, or --chat <question> --league <id> to test the chat AI."
         );
     }
     Ok(())

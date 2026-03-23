@@ -14,11 +14,12 @@ const CREATE_MESSAGE_MUTATION: &str = r#"mutation create_message($text: String!,
   }
 }"#;
 
-const GET_MESSAGES_QUERY: &str = r#"query get_messages($parent_type: String!, $parent_id: Snowflake!, $message_id: Snowflake) {
-  get_messages(parent_type: $parent_type, parent_id: $parent_id, message_id: $message_id) {
+const GET_MESSAGES_QUERY: &str = r#"query messages($parent_id: Snowflake!, $before: Snowflake) {
+  messages(parent_id: $parent_id, before: $before) {
     message_id
     author_id
     author_display_name
+    author_is_bot
     text
     created
   }
@@ -51,6 +52,7 @@ pub struct ChatMessage {
     pub message_id: Option<String>,
     pub author_id: Option<String>,
     pub author_display_name: Option<String>,
+    pub author_is_bot: Option<bool>,
     pub text: Option<String>,
     pub created: Option<i64>,
 }
@@ -63,7 +65,7 @@ struct GetMessagesResponse {
 
 #[derive(Deserialize)]
 struct GetMessagesData {
-    get_messages: Option<Vec<ChatMessage>>,
+    messages: Option<Vec<ChatMessage>>,
 }
 
 /// JWT claims we care about for expiry checking.
@@ -185,16 +187,15 @@ impl SleeperGraphql {
         after_message_id: Option<&str>,
     ) -> Result<Vec<ChatMessage>> {
         let mut variables = serde_json::json!({
-            "parent_type": "league",
             "parent_id": league_id,
         });
 
         if let Some(msg_id) = after_message_id {
-            variables["message_id"] = serde_json::Value::String(msg_id.to_string());
+            variables["before"] = serde_json::Value::String(msg_id.to_string());
         }
 
         let req = serde_json::json!({
-            "operationName": "get_messages",
+            "operationName": "messages",
             "query": GET_MESSAGES_QUERY,
             "variables": variables,
         });
@@ -231,7 +232,7 @@ impl SleeperGraphql {
 
         Ok(msg_resp
             .data
-            .and_then(|d| d.get_messages)
+            .and_then(|d| d.messages)
             .unwrap_or_default())
     }
 

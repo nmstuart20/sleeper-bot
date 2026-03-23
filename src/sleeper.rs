@@ -43,21 +43,34 @@ pub struct Roster {
 pub struct RosterSettings {
     pub wins: Option<u32>,
     pub losses: Option<u32>,
+    pub ties: Option<u32>,
     pub fpts: Option<u64>,
     pub fpts_decimal: Option<u64>,
+    pub fpts_against: Option<u64>,
+    pub fpts_against_decimal: Option<u64>,
 }
 
 impl RosterSettings {
     pub fn record(&self) -> String {
         let w = self.wins.unwrap_or(0);
         let l = self.losses.unwrap_or(0);
-        format!("{w}-{l}")
+        let t = self.ties.unwrap_or(0);
+        if t > 0 {
+            format!("{w}-{l}-{t}")
+        } else {
+            format!("{w}-{l}")
+        }
     }
 
-    #[allow(dead_code)]
     pub fn total_points(&self) -> f64 {
         let fpts = self.fpts.unwrap_or(0) as f64;
         let dec = self.fpts_decimal.unwrap_or(0) as f64;
+        fpts + dec / 100.0
+    }
+
+    pub fn points_against(&self) -> f64 {
+        let fpts = self.fpts_against.unwrap_or(0) as f64;
+        let dec = self.fpts_against_decimal.unwrap_or(0) as f64;
         fpts + dec / 100.0
     }
 }
@@ -95,6 +108,48 @@ pub struct DraftPick {
     pub roster_id: Option<u32>,
     pub previous_owner_id: Option<u32>,
     pub owner_id: Option<u32>,
+}
+
+/// Metadata for a league season.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct League {
+    pub league_id: Option<String>,
+    pub name: Option<String>,
+    pub season: Option<String>,
+    pub status: Option<String>,
+    pub previous_league_id: Option<String>,
+}
+
+/// A single matchup entry in a playoff bracket.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct BracketMatch {
+    pub r: u32,
+    pub m: u32,
+    pub t1: Option<u32>,
+    pub t2: Option<u32>,
+    pub w: Option<u32>,
+    pub l: Option<u32>,
+}
+
+/// Champion entry for a single historical season.
+#[derive(Debug, Clone)]
+pub struct SeasonChampion {
+    pub season: String,
+    pub display_name: String,
+}
+
+/// All-time aggregated stats for a single user across all seasons.
+#[derive(Debug, Clone, Default)]
+pub struct AllTimeUserStats {
+    pub display_name: String,
+    pub seasons: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub points_for: f64,
+    pub points_against: f64,
+    pub championships: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -232,6 +287,155 @@ impl SleeperClient {
     pub async fn get_rosters(&self, league_id: &str) -> Result<Vec<Roster>> {
         self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/rosters"))
             .await
+    }
+
+    pub async fn get_league(&self, league_id: &str) -> Result<League> {
+        self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}"))
+            .await
+    }
+
+    pub async fn get_winners_bracket(&self, league_id: &str) -> Result<Vec<BracketMatch>> {
+        self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/winners_bracket"))
+            .await
+    }
+
+    /// Walk back through the previous_league_id chain and collect:
+    /// - A champion per completed season
+    /// - All-time win/loss/points aggregated per user_id
+    ///
+    /// Includes the current season in stats but only marks a champion if status == "complete".
+    pub async fn fetch_league_history(
+        &self,
+        current_league_id: &str,
+    ) -> (Vec<SeasonChampion>, Vec<AllTimeUserStats>) {
+        let mut champions: Vec<SeasonChampion> = Vec::new();
+        // user_id → stats
+        let mut stats_map: HashMap<String, AllTimeUserStats> = HashMap::new();
+
+        let mut league_id = current_league_id.to_string();
+        let mut visited = std::collections::HashSet::new();
+
+        loop {
+            if visited.contains(&league_id) {
+                break;
+            }
+            visited.insert(league_id.clone());
+
+            // Fetch league metadata
+            let league = match self.get_league(&league_id).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Warning: failed to fetch league {league_id}: {e}");
+                    break;
+                }
+            };
+
+            let season = league.season.clone().unwrap_or_else(|| league_id.clone());
+            let is_complete = league.status.as_deref() == Some("complete");
+
+            // Fetch users and rosters for this season
+            let users: Vec<User> = match self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/users")).await {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("Warning: failed to fetch users for league {league_id}: {e}");
+                    vec![]
+                }
+            };
+            let rosters: Vec<Roster> = match self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/rosters")).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Warning: failed to fetch rosters for league {league_id}: {e}");
+                    vec![]
+                }
+            };
+
+            // Build user_id → display name for this season
+            let user_names: HashMap<&str, &str> = users
+                .iter()
+                .filter_map(|u| {
+                    let name = u.display_name.as_deref()?;
+                    Some((u.user_id.as_str(), name))
+                })
+                .collect();
+
+            // Build roster_id → owner_id for this season
+            let roster_owner: HashMap<u32, &str> = rosters
+                .iter()
+                .filter_map(|r| r.owner_id.as_deref().map(|oid| (r.roster_id, oid)))
+                .collect();
+
+            // Accumulate per-user stats from rosters
+            for roster in &rosters {
+                let owner_id = match roster.owner_id.as_deref() {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let display_name = user_names
+                    .get(owner_id)
+                    .copied()
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let settings = match &roster.settings {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let entry = stats_map.entry(owner_id.to_string()).or_insert_with(|| AllTimeUserStats {
+                    display_name: display_name.clone(),
+                    ..Default::default()
+                });
+                // Keep display name fresh (most recent season)
+                entry.display_name = display_name;
+                entry.seasons += 1;
+                entry.wins += settings.wins.unwrap_or(0);
+                entry.losses += settings.losses.unwrap_or(0);
+                entry.points_for += settings.total_points();
+                entry.points_against += settings.points_against();
+            }
+
+            // Find champion from winners bracket (only for completed seasons)
+            if is_complete {
+                if let Ok(bracket) = self.get_winners_bracket(&league_id).await {
+                    // Championship game = highest round, match #1
+                    if let Some(max_round) = bracket.iter().map(|b| b.r).max() {
+                        if let Some(champ_match) = bracket
+                            .iter()
+                            .find(|b| b.r == max_round && b.m == 1 && b.w.is_some())
+                        {
+                            if let Some(winner_roster_id) = champ_match.w {
+                                let owner_id = roster_owner.get(&winner_roster_id).copied().unwrap_or("");
+                                let name = user_names.get(owner_id).copied().unwrap_or("Unknown");
+                                champions.push(SeasonChampion {
+                                    season: season.clone(),
+                                    display_name: name.to_string(),
+                                });
+                                // Increment championship count
+                                if let Some(entry) = stats_map.get_mut(owner_id) {
+                                    entry.championships += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Walk back to previous season
+            match league.previous_league_id {
+                Some(ref prev) if !prev.is_empty() && prev != "0" => {
+                    league_id = prev.clone();
+                }
+                _ => break,
+            }
+        }
+
+        // Sort champions most-recent first
+        champions.sort_by(|a, b| b.season.cmp(&a.season));
+
+        let mut all_time: Vec<AllTimeUserStats> = stats_map.into_values().collect();
+        // Sort by wins descending
+        all_time.sort_by(|a, b| b.wins.cmp(&a.wins));
+
+        (champions, all_time)
     }
 
     pub async fn get_transactions(&self, league_id: &str, week: u32) -> Result<Vec<Transaction>> {
@@ -509,8 +713,11 @@ mod tests {
         let settings = RosterSettings {
             wins: Some(8),
             losses: Some(2),
+            ties: None,
             fpts: Some(1234),
             fpts_decimal: Some(56),
+            fpts_against: Some(1100),
+            fpts_against_decimal: Some(0),
         };
         assert_eq!(settings.record(), "8-2");
         assert!((settings.total_points() - 1234.56).abs() < 0.001);

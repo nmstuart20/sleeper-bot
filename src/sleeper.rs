@@ -394,15 +394,14 @@ impl SleeperClient {
             }
 
             // Find champion from winners bracket (only for completed seasons)
-            if is_complete {
-                if let Ok(bracket) = self.get_winners_bracket(&league_id).await {
+            if is_complete
+                && let Ok(bracket) = self.get_winners_bracket(&league_id).await {
                     // Championship game = highest round, match #1
-                    if let Some(max_round) = bracket.iter().map(|b| b.r).max() {
-                        if let Some(champ_match) = bracket
+                    if let Some(max_round) = bracket.iter().map(|b| b.r).max()
+                        && let Some(champ_match) = bracket
                             .iter()
                             .find(|b| b.r == max_round && b.m == 1 && b.w.is_some())
-                        {
-                            if let Some(winner_roster_id) = champ_match.w {
+                            && let Some(winner_roster_id) = champ_match.w {
                                 let owner_id = roster_owner.get(&winner_roster_id).copied().unwrap_or("");
                                 let name = user_names.get(owner_id).copied().unwrap_or("Unknown");
                                 champions.push(SeasonChampion {
@@ -414,10 +413,7 @@ impl SleeperClient {
                                     entry.championships += 1;
                                 }
                             }
-                        }
-                    }
                 }
-            }
 
             // Walk back to previous season
             match league.previous_league_id {

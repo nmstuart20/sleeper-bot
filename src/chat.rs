@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::news;
 use crate::sleeper::{
-    AllTimeUserStats, Player, PlayerSeasonEntry, PlayerStats, Roster, SeasonChampion, Transaction,
-    User,
+    AllTimeUserStats, League, Player, PlayerSeasonEntry, PlayerStats, Roster, SeasonChampion,
+    Transaction, User,
 };
 
 const BOT_USERNAME: &str = "tradegimp210";
@@ -33,6 +33,7 @@ pub struct LeagueContextParams<'a> {
     pub all_time_stats: &'a [AllTimeUserStats],
     pub projections: &'a HashMap<String, PlayerStats>,
     pub scoring: &'a str,
+    pub league: Option<&'a League>,
 }
 
 struct StandingsEntry {
@@ -158,7 +159,19 @@ pub fn build_league_context(params: &LeagueContextParams<'_>) -> String {
         )
     });
 
-    let mut ctx = String::from("LEAGUE STANDINGS:\n");
+    // League settings from API
+    let mut ctx = if let Some(league) = params.league {
+        let settings_ctx = league.format_settings_context();
+        if settings_ctx.is_empty() {
+            String::new()
+        } else {
+            format!("{settings_ctx}\n")
+        }
+    } else {
+        String::new()
+    };
+
+    ctx.push_str("LEAGUE STANDINGS:\n");
     for (i, entry) in standings.iter().enumerate() {
         ctx.push_str(&format!(
             "  {}. {} ({}, {:.1} PF, {:.1} PA)",

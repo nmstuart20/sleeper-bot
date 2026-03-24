@@ -307,6 +307,7 @@ async fn chat_poll_loop(
 
     // Pre-load league data
     println!("Loading league data for chat...");
+    let league = sleeper.get_league(league_id).await?;
     let users = sleeper.get_users(league_id).await?;
     let rosters = sleeper.get_rosters(league_id).await?;
     let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
@@ -334,6 +335,7 @@ async fn chat_poll_loop(
         all_time_stats: &all_time_stats,
         projections: &projections,
         scoring,
+        league: Some(&league),
     });
 
     loop {
@@ -447,6 +449,7 @@ async fn run_debug(
 
         println!("Loading league data...");
         let mut sleeper = SleeperClient::new();
+        let league_data = sleeper.get_league(&league_id).await?;
         let users = sleeper.get_users(&league_id).await?;
         let rosters = sleeper.get_rosters(&league_id).await?;
         let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
@@ -476,6 +479,7 @@ async fn run_debug(
             all_time_stats: &all_time_stats,
             projections: &projections,
             scoring,
+            league: Some(&league_data),
         });
 
         println!("\n--- League Context ---\n{league_context}\n---\n");

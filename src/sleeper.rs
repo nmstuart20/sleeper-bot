@@ -152,6 +152,82 @@ pub struct AllTimeUserStats {
     pub championships: u32,
 }
 
+/// Per-player season stats or projections from the Sleeper API.
+/// Fields are all optional because not every player has every stat category.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[allow(dead_code)]
+pub struct PlayerStats {
+    pub pts_half_ppr: Option<f64>,
+    pub pts_ppr: Option<f64>,
+    pub pts_std: Option<f64>,
+    pub gp: Option<f64>,
+    pub rec: Option<f64>,
+    pub rec_yd: Option<f64>,
+    pub rec_td: Option<f64>,
+    pub rush_att: Option<f64>,
+    pub rush_yd: Option<f64>,
+    pub rush_td: Option<f64>,
+    pub pass_yd: Option<f64>,
+    pub pass_td: Option<f64>,
+    pub pass_int: Option<f64>,
+    pub pass_att: Option<f64>,
+    pub fum_lost: Option<f64>,
+}
+
+impl PlayerStats {
+    /// Build a concise summary string from the stats.
+    pub fn summary(&self, scoring: &str) -> String {
+        let pts = match scoring {
+            "ppr" => self.pts_ppr,
+            "std" => self.pts_std,
+            _ => self.pts_half_ppr, // default to half PPR
+        };
+        let mut parts = Vec::new();
+
+        if let Some(p) = pts {
+            parts.push(format!("{p:.1} pts"));
+        }
+        if let Some(gp) = self.gp {
+            let gp = gp as u32;
+            if gp > 0 {
+                parts.push(format!("{gp} gms"));
+                if let Some(p) = pts {
+                    parts.push(format!("{:.1} ppg", p / gp as f64));
+                }
+            }
+        }
+
+        // Show relevant stat lines based on what's present
+        if let Some(pass_yd) = self.pass_yd {
+            let td = self.pass_td.unwrap_or(0.0) as u32;
+            let int = self.pass_int.unwrap_or(0.0) as u32;
+            parts.push(format!("{:.0} pass yds, {} TD, {} INT", pass_yd, td, int));
+        }
+        if let Some(rush_yd) = self.rush_yd {
+            if rush_yd > 10.0 {
+                let td = self.rush_td.unwrap_or(0.0) as u32;
+                parts.push(format!("{:.0} rush yds, {} TD", rush_yd, td));
+            }
+        }
+        if let Some(rec) = self.rec {
+            if rec > 1.0 {
+                let yd = self.rec_yd.unwrap_or(0.0);
+                let td = self.rec_td.unwrap_or(0.0) as u32;
+                parts.push(format!("{:.0} rec, {:.0} rec yds, {} TD", rec, yd, td));
+            }
+        }
+
+        parts.join(", ")
+    }
+}
+
+/// Aggregated fantasy stats for a player across multiple seasons.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerSeasonEntry {
+    pub season: String,
+    pub stats: PlayerStats,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Player {
     #[serde(default)]
@@ -441,6 +517,74 @@ impl SleeperClient {
         all_time.sort_by(|a, b| b.wins.cmp(&a.wins));
 
         (champions, all_time)
+    }
+
+    /// Fetch season-long stats for a given NFL season (e.g. "2025").
+    pub async fn get_season_stats(
+        &self,
+        season: &str,
+    ) -> Result<HashMap<String, PlayerStats>> {
+        self.get_json_with_retry(&format!("{BASE_URL}/stats/nfl/regular/{season}"))
+            .await
+    }
+
+    /// Fetch season-long projections for a given NFL season.
+    pub async fn get_season_projections(
+        &self,
+        season: &str,
+    ) -> Result<HashMap<String, PlayerStats>> {
+        self.get_json_with_retry(&format!("{BASE_URL}/projections/nfl/regular/{season}"))
+            .await
+    }
+
+    /// Fetch historical stats for the last N seasons plus current projections.
+    /// Returns (season_stats_by_player_id, current_projections_by_player_id).
+    pub async fn fetch_player_stats(
+        &self,
+        current_season: &str,
+        history_years: u32,
+    ) -> (HashMap<String, Vec<PlayerSeasonEntry>>, HashMap<String, PlayerStats>) {
+        let current_year: u32 = current_season.parse().unwrap_or(2025);
+
+        // Fetch historical stats
+        let mut all_stats: HashMap<String, Vec<PlayerSeasonEntry>> = HashMap::new();
+        for year_offset in 0..history_years {
+            let year = current_year - year_offset;
+            let season = year.to_string();
+            match self.get_season_stats(&season).await {
+                Ok(stats) => {
+                    for (pid, st) in stats {
+                        // Skip players with no meaningful points
+                        let pts = st.pts_half_ppr.unwrap_or(0.0);
+                        if pts < 1.0 {
+                            continue;
+                        }
+                        all_stats.entry(pid).or_default().push(PlayerSeasonEntry {
+                            season: season.clone(),
+                            stats: st,
+                        });
+                    }
+                    println!("  Loaded {season} stats.");
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not fetch {season} stats: {e}");
+                }
+            }
+        }
+
+        // Fetch current season projections
+        let projections = match self.get_season_projections(current_season).await {
+            Ok(p) => {
+                println!("  Loaded {current_season} projections.");
+                p
+            }
+            Err(e) => {
+                eprintln!("Warning: could not fetch {current_season} projections: {e}");
+                HashMap::new()
+            }
+        };
+
+        (all_stats, projections)
     }
 
     pub async fn get_transactions(&self, league_id: &str, week: u32) -> Result<Vec<Transaction>> {

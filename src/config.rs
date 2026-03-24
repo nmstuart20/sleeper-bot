@@ -10,6 +10,12 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct LeagueConfig {
     pub rules: String,
+    #[serde(default = "default_scoring")]
+    pub scoring: String,
+}
+
+fn default_scoring() -> String {
+    "half_ppr".to_string()
 }
 
 impl Config {

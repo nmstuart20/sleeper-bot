@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use crate::news;
-use crate::sleeper::{AllTimeUserStats, Player, Roster, SeasonChampion, Transaction, User};
+use crate::sleeper::{
+    AllTimeUserStats, Player, PlayerSeasonEntry, PlayerStats, Roster, SeasonChampion, Transaction,
+    User,
+};
 
 const BOT_USERNAME: &str = "tradegimp210";
 
@@ -28,6 +31,8 @@ pub fn build_league_context(
     roster_names: &HashMap<u32, String>,
     champions: &[SeasonChampion],
     all_time_stats: &[AllTimeUserStats],
+    projections: &HashMap<String, PlayerStats>,
+    scoring: &str,
 ) -> String {
     let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 
@@ -240,6 +245,62 @@ pub fn build_league_context(
         }
     }
 
+    // Top available players (waiver wire)
+    if !projections.is_empty() {
+        // Collect all rostered player IDs
+        let rostered: std::collections::HashSet<&str> = rosters
+            .iter()
+            .flat_map(|r| {
+                r.players
+                    .as_ref()
+                    .map(|ps| ps.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // Find unrostered players with projections, sorted by projected points
+        let pts_key = |stats: &PlayerStats| -> f64 {
+            match scoring {
+                "ppr" => stats.pts_ppr.unwrap_or(0.0),
+                "std" => stats.pts_std.unwrap_or(0.0),
+                _ => stats.pts_half_ppr.unwrap_or(0.0),
+            }
+        };
+
+        let mut available: Vec<(&str, &str, &str, f64)> = projections
+            .iter()
+            .filter(|(pid, _)| !rostered.contains(pid.as_str()))
+            .filter_map(|(pid, proj)| {
+                let pts = pts_key(proj);
+                if pts < 10.0 {
+                    return None;
+                }
+                let player = players.get(pid)?;
+                let pos = player.position.as_deref().unwrap_or("??");
+                // Only include skill positions relevant to fantasy
+                if !matches!(pos, "QB" | "RB" | "WR" | "TE" | "K" | "DEF") {
+                    return None;
+                }
+                let team = player.team.as_deref().unwrap_or("FA");
+                let name_str = pid.as_str(); // we'll resolve below
+                Some((name_str, pos, team, pts))
+            })
+            .collect();
+
+        available.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        if !available.is_empty() {
+            ctx.push_str("\nTOP WAIVER WIRE PLAYERS (unrostered):\n");
+            for (pid, pos, team, pts) in available.iter().take(200) {
+                let name = players
+                    .get(*pid)
+                    .map(|p| p.full_name())
+                    .unwrap_or_else(|| pid.to_string());
+                ctx.push_str(&format!("  {name} ({pos}, {team}) — {pts:.1} proj pts\n"));
+            }
+        }
+    }
+
     ctx
 }
 
@@ -326,8 +387,14 @@ fn extract_rss_titles(xml: &str) -> Vec<String> {
 }
 
 /// Find players mentioned in a message by matching against player full names.
-/// Returns a formatted string with detailed info for each matched player.
-pub fn find_mentioned_players(message: &str, players: &HashMap<String, Player>) -> String {
+/// Returns a formatted string with detailed info, historical stats, and projections.
+pub fn find_mentioned_players(
+    message: &str,
+    players: &HashMap<String, Player>,
+    historical_stats: &HashMap<String, Vec<PlayerSeasonEntry>>,
+    projections: &HashMap<String, PlayerStats>,
+    scoring: &str,
+) -> String {
     let lower_msg = message.to_lowercase();
     let mut mentioned = Vec::new();
 
@@ -344,7 +411,27 @@ pub fn find_mentioned_players(message: &str, players: &HashMap<String, Player>) 
             if !summary.is_empty() {
                 info.push_str(&format!(" — {summary}"));
             }
-            // Note which roster owns them, if any
+
+            // Add historical season stats
+            if let Some(seasons) = historical_stats.get(id) {
+                let mut sorted = seasons.clone();
+                sorted.sort_by(|a, b| b.season.cmp(&a.season));
+                for entry in &sorted {
+                    let s = entry.stats.summary(scoring);
+                    if !s.is_empty() {
+                        info.push_str(&format!("\n    {} season: {}", entry.season, s));
+                    }
+                }
+            }
+
+            // Add current projections
+            if let Some(proj) = projections.get(id) {
+                let s = proj.summary(scoring);
+                if !s.is_empty() {
+                    info.push_str(&format!("\n    Projected: {}", s));
+                }
+            }
+
             mentioned.push((id.clone(), info));
         }
     }

@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
             character,
         } => {
             let analyzer = build_analyzer(&provider, &character, league_rules)?;
-            run_watch(&league, interval, chat_interval, days, league_rules, analyzer.as_ref()).await
+            run_watch(&league, interval, chat_interval, days, league_rules, &config.league.scoring, analyzer.as_ref()).await
         }
         Cli::Debug {
             check_token,
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            run_debug(check_token, send, chat, league, league_rules, analyzer.as_deref()).await
+            run_debug(check_token, send, chat, league, league_rules, &config.league.scoring, analyzer.as_deref()).await
         }
     }
 }
@@ -194,6 +194,7 @@ async fn run_watch(
     chat_interval: u64,
     days: u64,
     league_rules: &str,
+    scoring: &str,
     analyzer: &dyn TradeAnalyzer,
 ) -> Result<()> {
     let gql = match setup_graphql() {
@@ -208,7 +209,7 @@ async fn run_watch(
     );
 
     let trade_loop = trade_poll_loop(league_id, trade_interval, days, analyzer, &gql);
-    let chat_loop = chat_poll_loop(league_id, chat_interval, league_rules, analyzer, &gql);
+    let chat_loop = chat_poll_loop(league_id, chat_interval, league_rules, scoring, analyzer, &gql);
 
     // Run both loops concurrently — if either returns an error, report it
     tokio::select! {
@@ -258,6 +259,7 @@ async fn chat_poll_loop(
     league_id: &str,
     interval: u64,
     league_rules: &str,
+    scoring: &str,
     analyzer: &dyn TradeAnalyzer,
     gql: &SleeperGraphql,
 ) -> Result<()> {
@@ -290,6 +292,11 @@ async fn chat_poll_loop(
     println!("Loading league history...");
     let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
 
+    println!("Loading player stats and projections...");
+    let (historical_stats, projections) = sleeper
+        .fetch_player_stats(&nfl_state.season, 3)
+        .await;
+
     let league_context = chat::build_league_context(
         &users,
         &rosters,
@@ -298,6 +305,8 @@ async fn chat_poll_loop(
         &roster_names,
         &champions,
         &all_time_stats,
+        &projections,
+        scoring,
     );
 
     loop {
@@ -339,7 +348,13 @@ async fn chat_poll_loop(
                     println!("\nMention from {author}: \"{text}\"");
 
                     println!("Looking up mentioned players...");
-                    let player_context = chat::find_mentioned_players(&question, &players);
+                    let player_context = chat::find_mentioned_players(
+                        &question,
+                        &players,
+                        &historical_stats,
+                        &projections,
+                        scoring,
+                    );
 
                     println!("Searching for context...");
                     let search_results = chat::search_for_context(&question).await;
@@ -386,6 +401,7 @@ async fn run_debug(
     chat_question: Option<String>,
     league: Option<String>,
     league_rules: &str,
+    scoring: &str,
     analyzer: Option<&dyn TradeAnalyzer>,
 ) -> Result<()> {
     if check_token {
@@ -419,6 +435,11 @@ async fn run_debug(
         println!("Loading league history...");
         let (champions, all_time_stats) = sleeper.fetch_league_history(&league_id).await;
 
+        println!("Loading player stats and projections...");
+        let (historical_stats, projections) = sleeper
+            .fetch_player_stats(&nfl_state.season, 3)
+            .await;
+
         let league_context = chat::build_league_context(
             &users,
             &rosters,
@@ -427,12 +448,20 @@ async fn run_debug(
             &roster_names,
             &champions,
             &all_time_stats,
+            &projections,
+            scoring,
         );
 
         println!("\n--- League Context ---\n{league_context}\n---\n");
 
         println!("Looking up mentioned players...");
-        let player_context = chat::find_mentioned_players(&question, &players);
+        let player_context = chat::find_mentioned_players(
+            &question,
+            &players,
+            &historical_stats,
+            &projections,
+            scoring,
+        );
         if !player_context.is_empty() {
             println!("{player_context}");
         }

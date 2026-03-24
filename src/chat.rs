@@ -22,21 +22,43 @@ pub fn strip_mention(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Parameters for building the league context string.
+pub struct LeagueContextParams<'a> {
+    pub users: &'a [User],
+    pub rosters: &'a [Roster],
+    pub players: &'a HashMap<String, Player>,
+    pub recent_transactions: &'a [Transaction],
+    pub roster_names: &'a HashMap<u32, String>,
+    pub champions: &'a [SeasonChampion],
+    pub all_time_stats: &'a [AllTimeUserStats],
+    pub projections: &'a HashMap<String, PlayerStats>,
+    pub scoring: &'a str,
+}
+
+struct StandingsEntry {
+    name: String,
+    record: String,
+    points: f64,
+    pts_against: f64,
+    starters: Vec<String>,
+    bench: Vec<String>,
+}
+
 /// Build a league context string with standings, points, roster info, recent transactions, and history.
-pub fn build_league_context(
-    users: &[User],
-    rosters: &[Roster],
-    players: &HashMap<String, Player>,
-    recent_transactions: &[Transaction],
-    roster_names: &HashMap<u32, String>,
-    champions: &[SeasonChampion],
-    all_time_stats: &[AllTimeUserStats],
-    projections: &HashMap<String, PlayerStats>,
-    scoring: &str,
-) -> String {
+pub fn build_league_context(params: &LeagueContextParams<'_>) -> String {
+    let users = params.users;
+    let rosters = params.rosters;
+    let players = params.players;
+    let recent_transactions = params.recent_transactions;
+    let roster_names = params.roster_names;
+    let champions = params.champions;
+    let all_time_stats = params.all_time_stats;
+    let projections = params.projections;
+    let scoring = params.scoring;
+
     let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 
-    let mut standings: Vec<(String, String, f64, f64, Vec<String>, Vec<String>)> = Vec::new();
+    let mut standings: Vec<StandingsEntry> = Vec::new();
 
     for roster in rosters {
         let owner_id = match roster.owner_id.as_deref() {
@@ -105,37 +127,52 @@ pub fn build_league_context(
             })
             .unwrap_or_default();
 
-        standings.push((name, record, points, pts_against, starters, bench));
+        standings.push(StandingsEntry {
+            name,
+            record,
+            points,
+            pts_against,
+            starters,
+            bench,
+        });
     }
 
     // Sort by wins descending, then points as tiebreaker
     standings.sort_by(|a, b| {
-        let a_wins: u32 =
-            a.1.split('-')
-                .next()
-                .and_then(|w| w.parse().ok())
-                .unwrap_or(0);
-        let b_wins: u32 =
-            b.1.split('-')
-                .next()
-                .and_then(|w| w.parse().ok())
-                .unwrap_or(0);
-        b_wins
-            .cmp(&a_wins)
-            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        let a_wins: u32 = a
+            .record
+            .split('-')
+            .next()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(0);
+        let b_wins: u32 = b
+            .record
+            .split('-')
+            .next()
+            .and_then(|w| w.parse().ok())
+            .unwrap_or(0);
+        b_wins.cmp(&a_wins).then(
+            b.points
+                .partial_cmp(&a.points)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 
     let mut ctx = String::from("LEAGUE STANDINGS:\n");
-    for (i, (name, record, points, pts_against, starters, bench)) in standings.iter().enumerate() {
+    for (i, entry) in standings.iter().enumerate() {
         ctx.push_str(&format!(
-            "  {}. {name} ({record}, {points:.1} PF, {pts_against:.1} PA)",
-            i + 1
+            "  {}. {} ({}, {:.1} PF, {:.1} PA)",
+            i + 1,
+            entry.name,
+            entry.record,
+            entry.points,
+            entry.pts_against,
         ));
-        if !starters.is_empty() {
-            ctx.push_str(&format!("\n     Starters: {}", starters.join(", ")));
+        if !entry.starters.is_empty() {
+            ctx.push_str(&format!("\n     Starters: {}", entry.starters.join(", ")));
         }
-        if !bench.is_empty() {
-            ctx.push_str(&format!("\n     Bench: {}", bench.join(", ")));
+        if !entry.bench.is_empty() {
+            ctx.push_str(&format!("\n     Bench: {}", entry.bench.join(", ")));
         }
         ctx.push('\n');
     }

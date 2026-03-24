@@ -324,17 +324,17 @@ async fn chat_poll_loop(
     println!("Loading player stats and projections...");
     let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
-    let league_context = chat::build_league_context(
-        &users,
-        &rosters,
-        &players,
-        &recent_transactions,
-        &roster_names,
-        &champions,
-        &all_time_stats,
-        &projections,
+    let league_context = chat::build_league_context(&chat::LeagueContextParams {
+        users: &users,
+        rosters: &rosters,
+        players: &players,
+        recent_transactions: &recent_transactions,
+        roster_names: &roster_names,
+        champions: &champions,
+        all_time_stats: &all_time_stats,
+        projections: &projections,
         scoring,
-    );
+    });
 
     loop {
         match gql.fetch_messages(league_id, None).await {
@@ -466,17 +466,17 @@ async fn run_debug(
         let (historical_stats, projections) =
             sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
-        let league_context = chat::build_league_context(
-            &users,
-            &rosters,
-            &players,
-            &recent_transactions,
-            &roster_names,
-            &champions,
-            &all_time_stats,
-            &projections,
+        let league_context = chat::build_league_context(&chat::LeagueContextParams {
+            users: &users,
+            rosters: &rosters,
+            players: &players,
+            recent_transactions: &recent_transactions,
+            roster_names: &roster_names,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            projections: &projections,
             scoring,
-        );
+        });
 
         println!("\n--- League Context ---\n{league_context}\n---\n");
 

@@ -1,10 +1,10 @@
 # Sleeper Trade Review Bot
 
-A Rust CLI that monitors a Sleeper fantasy football league for completed trades, generates LLM-powered analysis with real-time news context, and optionally posts reviews to the league chat.
+A Rust CLI that monitors a Sleeper fantasy football league for trades and chat @mentions, generates LLM-powered analysis in a configurable character persona, and posts to the league chat.
 
 ## Setup
 
-**Create a `.env` file** in the project root:
+Create a `.env` file in the project root:
 
 ```
 SLEEPER_LEAGUE_ID=123456789
@@ -13,110 +13,96 @@ ANTHROPIC_API_KEY=sk-ant-...
 SLEEPER_TOKEN=eyJhbGciOiJIUzI1NiIs...
 ```
 
-### Environment variables
-
 | Variable | Required | Description |
 |---|---|---|
 | `SLEEPER_LEAGUE_ID` | Yes | Found in your league URL on sleeper.app |
-| `GEMINI_API_KEY` | If using Gemini | API key for Google Gemini (default provider) |
-| `ANTHROPIC_API_KEY` | If using Anthropic | API key for Claude |
-| `SLEEPER_TOKEN` | For `--post` | Auth token for posting to league chat |
+| `GEMINI_API_KEY` | If using Gemini | API key for Google Gemini |
+| `ANTHROPIC_API_KEY` | If using Anthropic | API key for Claude (default provider) |
+| `SLEEPER_TOKEN` | For posting/watch | Auth token from your browser session (lasts 1 year) |
+| `LLM_PROVIDER` | No | `anthropic` (default) or `gemini` |
+| `BOT_CHARACTER` | No | Character persona (default: `Donald Trump`) |
 
 ### Getting your Sleeper token
 
-The bot uses a token from your browser session to post messages. Tokens last **1 year**.
-
 1. Log into [sleeper.app](https://sleeper.app) in your browser
-2. Open DevTools (F12) → **Application** tab → **Local Storage** → `https://sleeper.app`
-3. Find and copy your auth token (a long `eyJ...` string)
-4. Add it to your `.env` as `SLEEPER_TOKEN=<your_token>`
+2. DevTools (F12) → **Application** → **Local Storage** → `https://sleeper.app`
+3. Copy the `eyJ...` auth token into `.env` as `SLEEPER_TOKEN`
 
-The bot checks the token expiry on every run and will:
-- Show remaining days on startup
-- Warn you when it's within 30 days of expiring
-- Error with refresh instructions if it's already expired
+## Commands
 
-## Usage
+### `check` — One-shot trade scan
 
-### Check for trades (one-shot)
+Scans all weeks for recent trades, analyzes with the LLM, and prints results.
 
 ```sh
-cargo run --release -- check --league <LEAGUE_ID>
+cargo run --release -- check --league <ID>
 ```
 
-Scans all weeks for recent trades, fetches player news, analyzes with the LLM, and prints results.
+| Flag | Default | Description |
+|---|---|---|
+| `--league <ID>` | `$SLEEPER_LEAGUE_ID` | League ID |
+| `--post` | off | Post reviews to Sleeper league chat |
+| `--provider <P>` | `anthropic` | `anthropic` or `gemini` |
+| `--days <N>` | `3` | Only process trades from the last N days |
+| `--character <C>` | `Donald Trump` | Character persona for the analysis |
 
-Add `--post` to also send the review to the Sleeper league chat:
+### `watch` — Continuous polling
+
+Polls for new trades **and** responds to @mentions in the league chat. Requires `SLEEPER_TOKEN`.
 
 ```sh
-cargo run --release -- check --league <LEAGUE_ID> --post
+cargo run --release -- watch --league <ID>
 ```
 
-Adjust the lookback window (default 2 days):
+| Flag | Default | Description |
+|---|---|---|
+| `--league <ID>` | `$SLEEPER_LEAGUE_ID` | League ID |
+| `--interval <S>` | `20` | Trade poll interval in seconds |
+| `--chat-interval <S>` | `20` | Chat poll interval in seconds |
+| `--provider <P>` | `anthropic` | `anthropic` or `gemini` |
+| `--days <N>` | `3` | Trade lookback window in days |
+| `--character <C>` | `Donald Trump` | Character persona |
+
+### `debug` — Test & troubleshoot
 
 ```sh
-cargo run --release -- check --league <LEAGUE_ID> --days 7
-```
-
-### Watch for trades (continuous)
-
-```sh
-cargo run --release -- watch --league <LEAGUE_ID>
-```
-
-Polls every 5 minutes (default). Change with `--interval <seconds>`:
-
-```sh
-cargo run --release -- watch --league <LEAGUE_ID> --interval 120
-```
-
-### Choose LLM provider
-
-Default is `gemini`. Switch with `--provider`:
-
-```sh
-cargo run --release -- check --league <LEAGUE_ID> --provider anthropic
-cargo run --release -- check --league <LEAGUE_ID> --provider gemini
-```
-
-Or set `LLM_PROVIDER` in your `.env`.
-
-### Debug / test connection
-
-Verify your token is valid and check expiry:
-
-```sh
+# Verify token and check expiry
 cargo run --release -- debug --check-token
+
+# Send a test message to league chat
+cargo run --release -- debug --send "Hello!" --league <ID>
+
+# Test the chat AI locally (prints response, does not post)
+cargo run --release -- debug --chat "Who won the league last year?" --league <ID>
 ```
 
-Send a test message to your league chat:
-
-```sh
-cargo run --release -- debug --send "Hello from the bot!" --league <LEAGUE_ID>
-```
-
-### Cron example
-
-Run every 5 minutes, posting to chat:
-
-```
-*/5 * * * * cd /path/to/sleeper_bot && cargo run --release -- check --league <LEAGUE_ID> --post
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--check-token` | — | Verify token validity and expiry |
+| `--send <MSG>` | — | Send a test message (requires `--league`) |
+| `--chat <Q>` | — | Test chat AI response (requires `--league`) |
+| `--league <ID>` | `$SLEEPER_LEAGUE_ID` | League ID |
+| `--provider <P>` | `anthropic` | LLM provider for `--chat` |
+| `--character <C>` | `Donald Trump` | Character persona for `--chat` |
 
 ## How it works
 
-1. Fetches the current NFL state from the Sleeper API
-2. Scans transactions across all weeks (0-18) to catch offseason/dynasty trades
-3. Resolves player names, team records, and draft pick details
-4. Enriches each player with metadata from Sleeper (age, injury status, depth chart position, years of experience)
-5. Fetches recent news headlines for each player via Google News RSS
-6. Sends a structured prompt with trade details, player context, news, and today's date to the configured LLM
-7. Optionally posts the review to the Sleeper league chat via GraphQL
-8. Tracks reviewed trade IDs in `.reviewed_trades.json` to avoid double-posting
+1. Fetches NFL state and scans transactions across weeks 0–18
+2. Resolves player names, team records, draft picks, and player metadata (age, injury, depth chart)
+3. Fetches recent news headlines via Google News RSS
+4. Sends structured prompt to the configured LLM with trade details, player context, and news
+5. In `watch` mode, also monitors league chat for @mentions and responds with league-aware answers
+6. Posts reviews/responses to Sleeper chat via GraphQL
+7. Tracks reviewed trades in `.reviewed_trades.json` and responded messages in `.chat_state.json` to avoid duplicates
+
+## Cron example
+
+```
+*/5 * * * * cd /path/to/sleeper_bot && cargo run --release -- check --league <ID> --post
+```
 
 ## Notes
 
-- The Sleeper GraphQL API (used for chat posting) is undocumented and may change. If posting fails, the bot falls back to terminal output.
+- The Sleeper GraphQL API is undocumented and may change. If posting fails, the bot falls back to terminal output.
 - The NFL player database (~40MB) is cached to `players_cache.json` and refreshed weekly.
-- News fetching uses Google News RSS and adds a small delay between requests to be respectful.
-- The bot scans all weeks (not just the current one) so it catches dynasty and offseason trades.
+- League configuration lives in `config.toml` (rules, scoring).

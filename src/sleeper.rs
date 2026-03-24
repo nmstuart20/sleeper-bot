@@ -200,24 +200,24 @@ impl League {
 
         // Key settings
         if let Some(settings) = &self.settings {
-            if let Some(taxi) = settings.taxi_slots {
-                if taxi > 0 {
-                    let years = settings.taxi_years.unwrap_or(0);
-                    let vets = settings.taxi_allow_vets.unwrap_or(0) == 1;
-                    let mut taxi_str = format!("Taxi squad: {taxi} slots");
-                    if years > 0 {
-                        taxi_str.push_str(&format!(", {years}-year eligibility"));
-                    }
-                    if vets {
-                        taxi_str.push_str(", vets allowed");
-                    }
-                    lines.push(taxi_str);
+            if let Some(taxi) = settings.taxi_slots
+                && taxi > 0
+            {
+                let years = settings.taxi_years.unwrap_or(0);
+                let vets = settings.taxi_allow_vets.unwrap_or(0) == 1;
+                let mut taxi_str = format!("Taxi squad: {taxi} slots");
+                if years > 0 {
+                    taxi_str.push_str(&format!(", {years}-year eligibility"));
                 }
+                if vets {
+                    taxi_str.push_str(", vets allowed");
+                }
+                lines.push(taxi_str);
             }
-            if let Some(ir) = settings.reserve_slots {
-                if ir > 0 {
-                    lines.push(format!("IR slots: {ir}"));
-                }
+            if let Some(ir) = settings.reserve_slots
+                && ir > 0
+            {
+                lines.push(format!("IR slots: {ir}"));
             }
             if let Some(playoffs) = settings.playoff_teams {
                 lines.push(format!("Playoff teams: {playoffs}"));
@@ -225,10 +225,10 @@ impl League {
             if let Some(week) = settings.playoff_week_start {
                 lines.push(format!("Playoffs start: Week {week}"));
             }
-            if let Some(deadline) = settings.trade_deadline {
-                if deadline > 0 {
-                    lines.push(format!("Trade deadline: Week {deadline}"));
-                }
+            if let Some(deadline) = settings.trade_deadline
+                && deadline > 0
+            {
+                lines.push(format!("Trade deadline: Week {deadline}"));
             }
             if let Some(review) = settings.trade_review_days {
                 lines.push(format!("Trade review period: {review} day(s)"));
@@ -245,10 +245,10 @@ impl League {
             };
             if let Some(desc) = waiver_desc {
                 let mut w = desc.to_string();
-                if settings.waiver_type == Some(2) {
-                    if let Some(budget) = settings.waiver_budget {
-                        w.push_str(&format!(", ${budget} budget"));
-                    }
+                if settings.waiver_type == Some(2)
+                    && let Some(budget) = settings.waiver_budget
+                {
+                    w.push_str(&format!(", ${budget} budget"));
                 }
                 lines.push(format!("Waivers: {w}"));
             }

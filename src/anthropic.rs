@@ -131,7 +131,10 @@ impl TradeAnalyzer for AnthropicClient {
         user_prompt: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
         let prompt = user_prompt.to_string();
-        Box::pin(async move { self.call_anthropic(&self.trade_system_prompt, &prompt).await })
+        Box::pin(async move {
+            self.call_anthropic(&self.trade_system_prompt, &prompt)
+                .await
+        })
     }
 
     fn generate(

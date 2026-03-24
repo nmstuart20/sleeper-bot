@@ -280,7 +280,6 @@ async fn chat_poll_loop(
         .get_all_transactions(league_id, max_week)
         .await
         .unwrap_or_default();
-
     println!("Loading league history...");
     let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
 

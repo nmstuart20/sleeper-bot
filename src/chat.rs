@@ -123,7 +123,7 @@ pub fn build_league_context(
         };
 
         let mut shown = 0;
-        for tx in recent_transactions.iter().rev() {
+        for tx in recent_transactions.iter() {
             if shown >= 10 {
                 break;
             }

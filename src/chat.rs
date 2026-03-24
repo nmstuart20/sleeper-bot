@@ -31,7 +31,7 @@ pub fn build_league_context(
 ) -> String {
     let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 
-    let mut standings: Vec<(String, String, f64, f64, Vec<String>)> = Vec::new();
+    let mut standings: Vec<(String, String, f64, f64, Vec<String>, Vec<String>)> = Vec::new();
 
     for roster in rosters {
         let owner_id = match roster.owner_id.as_deref() {
@@ -61,14 +61,30 @@ pub fn build_league_context(
         let points = settings.map(|s| s.total_points()).unwrap_or(0.0);
         let pts_against = settings.map(|s| s.points_against()).unwrap_or(0.0);
 
-        // Get top starters
-        let starters: Vec<String> = roster
+        // Get starters
+        let starter_ids: Vec<&str> = roster
             .starters
+            .as_ref()
+            .map(|ids| ids.iter().filter(|id| *id != "0").map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+
+        let starters: Vec<String> = starter_ids
+            .iter()
+            .filter_map(|id| {
+                players.get(*id).map(|p| {
+                    let pos = p.position.as_deref().unwrap_or("??");
+                    format!("{} ({})", p.full_name(), pos)
+                })
+            })
+            .collect();
+
+        // Get bench players (all players minus starters)
+        let bench: Vec<String> = roster
+            .players
             .as_ref()
             .map(|ids| {
                 ids.iter()
-                    .filter(|id| *id != "0")
-                    .take(5)
+                    .filter(|id| !starter_ids.contains(&id.as_str()))
                     .filter_map(|id| {
                         players.get(id).map(|p| {
                             let pos = p.position.as_deref().unwrap_or("??");
@@ -79,7 +95,7 @@ pub fn build_league_context(
             })
             .unwrap_or_default();
 
-        standings.push((name, record, points, pts_against, starters));
+        standings.push((name, record, points, pts_against, starters, bench));
     }
 
     // Sort by wins descending, then points as tiebreaker
@@ -100,13 +116,16 @@ pub fn build_league_context(
     });
 
     let mut ctx = String::from("LEAGUE STANDINGS:\n");
-    for (i, (name, record, points, pts_against, starters)) in standings.iter().enumerate() {
+    for (i, (name, record, points, pts_against, starters, bench)) in standings.iter().enumerate() {
         ctx.push_str(&format!(
             "  {}. {name} ({record}, {points:.1} PF, {pts_against:.1} PA)",
             i + 1
         ));
         if !starters.is_empty() {
-            ctx.push_str(&format!(" - Key players: {}", starters.join(", ")));
+            ctx.push_str(&format!("\n     Starters: {}", starters.join(", ")));
+        }
+        if !bench.is_empty() {
+            ctx.push_str(&format!("\n     Bench: {}", bench.join(", ")));
         }
         ctx.push('\n');
     }
@@ -306,12 +325,48 @@ fn extract_rss_titles(xml: &str) -> Vec<String> {
     titles
 }
 
+/// Find players mentioned in a message by matching against player full names.
+/// Returns a formatted string with detailed info for each matched player.
+pub fn find_mentioned_players(message: &str, players: &HashMap<String, Player>) -> String {
+    let lower_msg = message.to_lowercase();
+    let mut mentioned = Vec::new();
+
+    for (id, player) in players {
+        let name = player.full_name();
+        if name.len() < 4 {
+            continue;
+        }
+        if lower_msg.contains(&name.to_lowercase()) {
+            let team = player.team.as_deref().unwrap_or("FA");
+            let pos = player.position.as_deref().unwrap_or("??");
+            let summary = player.context_summary();
+            let mut info = format!("{name} ({pos}, {team})");
+            if !summary.is_empty() {
+                info.push_str(&format!(" — {summary}"));
+            }
+            // Note which roster owns them, if any
+            mentioned.push((id.clone(), info));
+        }
+    }
+
+    if mentioned.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::from("PLAYER DETAILS:\n");
+    for (_id, info) in &mentioned {
+        result.push_str(&format!("  {info}\n"));
+    }
+    result
+}
+
 /// Build the full prompt for the LLM to respond to a chat mention.
 pub fn build_chat_prompt(
     author_name: &str,
     message: &str,
     league_context: &str,
     search_results: &str,
+    player_context: &str,
 ) -> String {
     let today = chrono::Local::now().format("%B %d, %Y");
     let mut prompt = format!(
@@ -321,12 +376,17 @@ pub fn build_chat_prompt(
          {league_context}\n"
     );
 
+    if !player_context.is_empty() {
+        prompt.push_str(player_context);
+        prompt.push('\n');
+    }
+
     if !search_results.is_empty() {
         prompt.push_str(search_results);
         prompt.push('\n');
     }
 
-    prompt.push_str("\nRespond to their message. Use the league data and search results above. If they're asking about a specific player, team, or matchup, give your honest take — don't hold back.");
+    prompt.push_str("\nRespond to their message. Use the league data, player details, and search results above. If they're asking about a specific player, team, or matchup, give your honest take using the concrete data provided — don't hold back.");
     prompt
 }
 

@@ -1,0 +1,3 @@
+# League rules — these are injected into LLM prompts so the bot understands your league format.
+[league]
+rules = "10 team superflex, full ppr league with deep 14 player benches, 2 IR spots and 3 taxi spots"

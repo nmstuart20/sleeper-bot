@@ -1,5 +1,6 @@
 mod anthropic;
 mod chat;
+mod config;
 mod gemini;
 mod graphql;
 mod llm;
@@ -36,7 +37,7 @@ enum Cli {
         #[arg(long)]
         post: bool,
         /// LLM provider to use for analysis
-        #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
+        #[arg(long, value_enum, default_value = "anthropic", env = "LLM_PROVIDER")]
         provider: LlmProvider,
         /// Only process trades from the last N days
         #[arg(long, default_value = "3")]
@@ -56,7 +57,7 @@ enum Cli {
         #[arg(long, default_value = "20")]
         chat_interval: u64,
         /// LLM provider to use for analysis
-        #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
+        #[arg(long, value_enum, default_value = "anthropic", env = "LLM_PROVIDER")]
         provider: LlmProvider,
         /// Only process trades from the last N days
         #[arg(long, default_value = "3")]
@@ -79,7 +80,7 @@ enum Cli {
         #[arg(long, env = "SLEEPER_LEAGUE_ID")]
         league: Option<String>,
         /// LLM provider to use for --chat test
-        #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
+        #[arg(long, value_enum, default_value = "anthropic", env = "LLM_PROVIDER")]
         provider: LlmProvider,
         /// Character persona for trade analysis
         #[arg(long, default_value = "Donald Trump", env = "BOT_CHARACTER")]
@@ -92,6 +93,10 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
 
+    let config_path = std::path::Path::new("config.toml");
+    let config = config::Config::load(config_path)?;
+    let league_rules = &config.league.rules;
+
     match cli {
         Cli::Check {
             league,
@@ -100,7 +105,7 @@ async fn main() -> Result<()> {
             days,
             character,
         } => {
-            let analyzer = build_analyzer(&provider, &character)?;
+            let analyzer = build_analyzer(&provider, &character, league_rules)?;
             run_check(&league, post, days, analyzer.as_ref()).await
         }
         Cli::Watch {
@@ -111,8 +116,8 @@ async fn main() -> Result<()> {
             days,
             character,
         } => {
-            let analyzer = build_analyzer(&provider, &character)?;
-            run_watch(&league, interval, chat_interval, days, analyzer.as_ref()).await
+            let analyzer = build_analyzer(&provider, &character, league_rules)?;
+            run_watch(&league, interval, chat_interval, days, league_rules, analyzer.as_ref()).await
         }
         Cli::Debug {
             check_token,
@@ -123,17 +128,17 @@ async fn main() -> Result<()> {
             character,
         } => {
             let analyzer = if chat.is_some() {
-                Some(build_analyzer(&provider, &character)?)
+                Some(build_analyzer(&provider, &character, league_rules)?)
             } else {
                 None
             };
-            run_debug(check_token, send, chat, league, analyzer.as_deref()).await
+            run_debug(check_token, send, chat, league, league_rules, analyzer.as_deref()).await
         }
     }
 }
 
-fn build_analyzer(provider: &LlmProvider, character: &str) -> Result<Box<dyn TradeAnalyzer>> {
-    let trade_prompt = llm::trade_system_prompt(character);
+fn build_analyzer(provider: &LlmProvider, character: &str, league_rules: &str) -> Result<Box<dyn TradeAnalyzer>> {
+    let trade_prompt = llm::trade_system_prompt(character, league_rules);
     println!("Character persona: {character}");
     match provider {
         LlmProvider::Anthropic => {
@@ -188,6 +193,7 @@ async fn run_watch(
     trade_interval: u64,
     chat_interval: u64,
     days: u64,
+    league_rules: &str,
     analyzer: &dyn TradeAnalyzer,
 ) -> Result<()> {
     let gql = match setup_graphql() {
@@ -202,7 +208,7 @@ async fn run_watch(
     );
 
     let trade_loop = trade_poll_loop(league_id, trade_interval, days, analyzer, &gql);
-    let chat_loop = chat_poll_loop(league_id, chat_interval, analyzer, &gql);
+    let chat_loop = chat_poll_loop(league_id, chat_interval, league_rules, analyzer, &gql);
 
     // Run both loops concurrently — if either returns an error, report it
     tokio::select! {
@@ -251,6 +257,7 @@ async fn trade_poll_loop(
 async fn chat_poll_loop(
     league_id: &str,
     interval: u64,
+    league_rules: &str,
     analyzer: &dyn TradeAnalyzer,
     gql: &SleeperGraphql,
 ) -> Result<()> {
@@ -331,6 +338,9 @@ async fn chat_poll_loop(
 
                     println!("\nMention from {author}: \"{text}\"");
 
+                    println!("Looking up mentioned players...");
+                    let player_context = chat::find_mentioned_players(&question, &players);
+
                     println!("Searching for context...");
                     let search_results = chat::search_for_context(&question).await;
 
@@ -339,10 +349,12 @@ async fn chat_poll_loop(
                         &question,
                         &league_context,
                         &search_results,
+                        &player_context,
                     );
 
                     println!("Generating response...");
-                    match analyzer.generate(llm::CHAT_SYSTEM_PROMPT, &prompt).await {
+                    let chat_sys = llm::chat_system_prompt(league_rules);
+                    match analyzer.generate(&chat_sys, &prompt).await {
                         Ok(response) => {
                             println!("Response: {response}");
                             match gql.send_message(league_id, &response).await {
@@ -373,6 +385,7 @@ async fn run_debug(
     send: Option<String>,
     chat_question: Option<String>,
     league: Option<String>,
+    league_rules: &str,
     analyzer: Option<&dyn TradeAnalyzer>,
 ) -> Result<()> {
     if check_token {
@@ -417,6 +430,13 @@ async fn run_debug(
         );
 
         println!("\n--- League Context ---\n{league_context}\n---\n");
+
+        println!("Looking up mentioned players...");
+        let player_context = chat::find_mentioned_players(&question, &players);
+        if !player_context.is_empty() {
+            println!("{player_context}");
+        }
+
         println!("Searching for context on: \"{question}\"");
         let search_results = chat::search_for_context(&question).await;
         if !search_results.is_empty() {
@@ -424,10 +444,11 @@ async fn run_debug(
         }
 
         let prompt =
-            chat::build_chat_prompt("debug_user", &question, &league_context, &search_results);
+            chat::build_chat_prompt("debug_user", &question, &league_context, &search_results, &player_context);
 
         println!("Generating response...");
-        let response = analyzer.generate(llm::CHAT_SYSTEM_PROMPT, &prompt).await?;
+        let chat_sys = llm::chat_system_prompt(league_rules);
+        let response = analyzer.generate(&chat_sys, &prompt).await?;
         println!("\n--- Chat Response ---\n{response}\n---");
     } else if let Some(msg) = send {
         let league_id = league.ok_or_else(|| anyhow::anyhow!("--league required with --send"))?;

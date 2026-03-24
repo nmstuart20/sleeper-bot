@@ -203,18 +203,18 @@ impl PlayerStats {
             let int = self.pass_int.unwrap_or(0.0) as u32;
             parts.push(format!("{:.0} pass yds, {} TD, {} INT", pass_yd, td, int));
         }
-        if let Some(rush_yd) = self.rush_yd {
-            if rush_yd > 10.0 {
-                let td = self.rush_td.unwrap_or(0.0) as u32;
-                parts.push(format!("{:.0} rush yds, {} TD", rush_yd, td));
-            }
+        if let Some(rush_yd) = self.rush_yd
+            && rush_yd > 10.0
+        {
+            let td = self.rush_td.unwrap_or(0.0) as u32;
+            parts.push(format!("{:.0} rush yds, {} TD", rush_yd, td));
         }
-        if let Some(rec) = self.rec {
-            if rec > 1.0 {
-                let yd = self.rec_yd.unwrap_or(0.0);
-                let td = self.rec_td.unwrap_or(0.0) as u32;
-                parts.push(format!("{:.0} rec, {:.0} rec yds, {} TD", rec, yd, td));
-            }
+        if let Some(rec) = self.rec
+            && rec > 1.0
+        {
+            let yd = self.rec_yd.unwrap_or(0.0);
+            let td = self.rec_td.unwrap_or(0.0) as u32;
+            parts.push(format!("{:.0} rec, {:.0} rec yds, {} TD", rec, yd, td));
         }
 
         parts.join(", ")
@@ -520,10 +520,7 @@ impl SleeperClient {
     }
 
     /// Fetch season-long stats for a given NFL season (e.g. "2025").
-    pub async fn get_season_stats(
-        &self,
-        season: &str,
-    ) -> Result<HashMap<String, PlayerStats>> {
+    pub async fn get_season_stats(&self, season: &str) -> Result<HashMap<String, PlayerStats>> {
         self.get_json_with_retry(&format!("{BASE_URL}/stats/nfl/regular/{season}"))
             .await
     }
@@ -543,7 +540,10 @@ impl SleeperClient {
         &self,
         current_season: &str,
         history_years: u32,
-    ) -> (HashMap<String, Vec<PlayerSeasonEntry>>, HashMap<String, PlayerStats>) {
+    ) -> (
+        HashMap<String, Vec<PlayerSeasonEntry>>,
+        HashMap<String, PlayerStats>,
+    ) {
         let current_year: u32 = current_season.parse().unwrap_or(2025);
 
         // Fetch historical stats

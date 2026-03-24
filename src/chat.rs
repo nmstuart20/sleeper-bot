@@ -70,7 +70,12 @@ pub fn build_league_context(
         let starter_ids: Vec<&str> = roster
             .starters
             .as_ref()
-            .map(|ids| ids.iter().filter(|id| *id != "0").map(|s| s.as_str()).collect())
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| *id != "0")
+                    .map(|s| s.as_str())
+                    .collect()
+            })
             .unwrap_or_default();
 
         let starters: Vec<String> = starter_ids

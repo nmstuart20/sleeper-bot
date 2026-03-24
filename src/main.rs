@@ -117,7 +117,16 @@ async fn main() -> Result<()> {
             character,
         } => {
             let analyzer = build_analyzer(&provider, &character, league_rules)?;
-            run_watch(&league, interval, chat_interval, days, league_rules, &config.league.scoring, analyzer.as_ref()).await
+            run_watch(
+                &league,
+                interval,
+                chat_interval,
+                days,
+                league_rules,
+                &config.league.scoring,
+                analyzer.as_ref(),
+            )
+            .await
         }
         Cli::Debug {
             check_token,
@@ -132,12 +141,25 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
-            run_debug(check_token, send, chat, league, league_rules, &config.league.scoring, analyzer.as_deref()).await
+            run_debug(
+                check_token,
+                send,
+                chat,
+                league,
+                league_rules,
+                &config.league.scoring,
+                analyzer.as_deref(),
+            )
+            .await
         }
     }
 }
 
-fn build_analyzer(provider: &LlmProvider, character: &str, league_rules: &str) -> Result<Box<dyn TradeAnalyzer>> {
+fn build_analyzer(
+    provider: &LlmProvider,
+    character: &str,
+    league_rules: &str,
+) -> Result<Box<dyn TradeAnalyzer>> {
     let trade_prompt = llm::trade_system_prompt(character, league_rules);
     println!("Character persona: {character}");
     match provider {
@@ -209,7 +231,14 @@ async fn run_watch(
     );
 
     let trade_loop = trade_poll_loop(league_id, trade_interval, days, analyzer, &gql);
-    let chat_loop = chat_poll_loop(league_id, chat_interval, league_rules, scoring, analyzer, &gql);
+    let chat_loop = chat_poll_loop(
+        league_id,
+        chat_interval,
+        league_rules,
+        scoring,
+        analyzer,
+        &gql,
+    );
 
     // Run both loops concurrently — if either returns an error, report it
     tokio::select! {
@@ -293,9 +322,7 @@ async fn chat_poll_loop(
     let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
 
     println!("Loading player stats and projections...");
-    let (historical_stats, projections) = sleeper
-        .fetch_player_stats(&nfl_state.season, 3)
-        .await;
+    let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
     let league_context = chat::build_league_context(
         &users,
@@ -436,9 +463,8 @@ async fn run_debug(
         let (champions, all_time_stats) = sleeper.fetch_league_history(&league_id).await;
 
         println!("Loading player stats and projections...");
-        let (historical_stats, projections) = sleeper
-            .fetch_player_stats(&nfl_state.season, 3)
-            .await;
+        let (historical_stats, projections) =
+            sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
         let league_context = chat::build_league_context(
             &users,
@@ -472,8 +498,13 @@ async fn run_debug(
             println!("Search results found.\n");
         }
 
-        let prompt =
-            chat::build_chat_prompt("debug_user", &question, &league_context, &search_results, &player_context);
+        let prompt = chat::build_chat_prompt(
+            "debug_user",
+            &question,
+            &league_context,
+            &search_results,
+            &player_context,
+        );
 
         println!("Generating response...");
         let chat_sys = llm::chat_system_prompt(league_rules);

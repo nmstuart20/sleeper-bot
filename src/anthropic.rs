@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{SYSTEM_PROMPT, TradeAnalyzer};
+use crate::llm::TradeAnalyzer;
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const MODEL: &str = "claude-sonnet-4-20250514";
@@ -9,6 +9,7 @@ const MODEL: &str = "claude-sonnet-4-20250514";
 pub struct AnthropicClient {
     client: reqwest::Client,
     api_key: String,
+    trade_system_prompt: String,
 }
 
 /// Kept for reference; the owned variant is used at runtime.
@@ -38,10 +39,11 @@ struct ContentBlock {
 }
 
 impl AnthropicClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, trade_system_prompt: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            trade_system_prompt,
         }
     }
 }
@@ -129,7 +131,7 @@ impl TradeAnalyzer for AnthropicClient {
         user_prompt: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
         let prompt = user_prompt.to_string();
-        Box::pin(async move { self.call_anthropic(SYSTEM_PROMPT, &prompt).await })
+        Box::pin(async move { self.call_anthropic(&self.trade_system_prompt, &prompt).await })
     }
 
     fn generate(

@@ -84,9 +84,19 @@ pub fn build_league_context(
 
     // Sort by wins descending, then points as tiebreaker
     standings.sort_by(|a, b| {
-        let a_wins: u32 = a.1.split('-').next().and_then(|w| w.parse().ok()).unwrap_or(0);
-        let b_wins: u32 = b.1.split('-').next().and_then(|w| w.parse().ok()).unwrap_or(0);
-        b_wins.cmp(&a_wins).then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+        let a_wins: u32 =
+            a.1.split('-')
+                .next()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(0);
+        let b_wins: u32 =
+            b.1.split('-')
+                .next()
+                .and_then(|w| w.parse().ok())
+                .unwrap_or(0);
+        b_wins
+            .cmp(&a_wins)
+            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     let mut ctx = String::from("LEAGUE STANDINGS:\n");
@@ -140,7 +150,10 @@ pub fn build_league_context(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    ctx.push_str(&format!("  Trade: {} completed a trade\n", teams.join(" and ")));
+                    ctx.push_str(&format!(
+                        "  Trade: {} completed a trade\n",
+                        teams.join(" and ")
+                    ));
                 }
                 "waiver" | "free_agent" => {
                     let adds: Vec<String> = tx

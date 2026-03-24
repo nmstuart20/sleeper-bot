@@ -334,14 +334,20 @@ impl SleeperClient {
             let is_complete = league.status.as_deref() == Some("complete");
 
             // Fetch users and rosters for this season
-            let users: Vec<User> = match self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/users")).await {
+            let users: Vec<User> = match self
+                .get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/users"))
+                .await
+            {
                 Ok(u) => u,
                 Err(e) => {
                     eprintln!("Warning: failed to fetch users for league {league_id}: {e}");
                     vec![]
                 }
             };
-            let rosters: Vec<Roster> = match self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/rosters")).await {
+            let rosters: Vec<Roster> = match self
+                .get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/rosters"))
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("Warning: failed to fetch rosters for league {league_id}: {e}");
@@ -380,10 +386,13 @@ impl SleeperClient {
                     None => continue,
                 };
 
-                let entry = stats_map.entry(owner_id.to_string()).or_insert_with(|| AllTimeUserStats {
-                    display_name: display_name.clone(),
-                    ..Default::default()
-                });
+                let entry =
+                    stats_map
+                        .entry(owner_id.to_string())
+                        .or_insert_with(|| AllTimeUserStats {
+                            display_name: display_name.clone(),
+                            ..Default::default()
+                        });
                 // Keep display name fresh (most recent season)
                 entry.display_name = display_name;
                 entry.seasons += 1;
@@ -394,26 +403,26 @@ impl SleeperClient {
             }
 
             // Find champion from winners bracket (only for completed seasons)
-            if is_complete
-                && let Ok(bracket) = self.get_winners_bracket(&league_id).await {
-                    // Championship game = highest round, match #1
-                    if let Some(max_round) = bracket.iter().map(|b| b.r).max()
-                        && let Some(champ_match) = bracket
-                            .iter()
-                            .find(|b| b.r == max_round && b.m == 1 && b.w.is_some())
-                            && let Some(winner_roster_id) = champ_match.w {
-                                let owner_id = roster_owner.get(&winner_roster_id).copied().unwrap_or("");
-                                let name = user_names.get(owner_id).copied().unwrap_or("Unknown");
-                                champions.push(SeasonChampion {
-                                    season: season.clone(),
-                                    display_name: name.to_string(),
-                                });
-                                // Increment championship count
-                                if let Some(entry) = stats_map.get_mut(owner_id) {
-                                    entry.championships += 1;
-                                }
-                            }
+            if is_complete && let Ok(bracket) = self.get_winners_bracket(&league_id).await {
+                // Championship game = highest round, match #1
+                if let Some(max_round) = bracket.iter().map(|b| b.r).max()
+                    && let Some(champ_match) = bracket
+                        .iter()
+                        .find(|b| b.r == max_round && b.m == 1 && b.w.is_some())
+                    && let Some(winner_roster_id) = champ_match.w
+                {
+                    let owner_id = roster_owner.get(&winner_roster_id).copied().unwrap_or("");
+                    let name = user_names.get(owner_id).copied().unwrap_or("Unknown");
+                    champions.push(SeasonChampion {
+                        season: season.clone(),
+                        display_name: name.to_string(),
+                    });
+                    // Increment championship count
+                    if let Some(entry) = stats_map.get_mut(owner_id) {
+                        entry.championships += 1;
+                    }
                 }
+            }
 
             // Walk back to previous season
             match league.previous_league_id {

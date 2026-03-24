@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{SYSTEM_PROMPT, TradeAnalyzer};
+use crate::llm::TradeAnalyzer;
 
 const MODEL: &str = "gemini-2.5-flash";
 
 pub struct GeminiClient {
     client: reqwest::Client,
     api_key: String,
+    trade_system_prompt: String,
 }
 
 #[derive(Serialize)]
@@ -62,10 +63,11 @@ struct GeminiError {
 }
 
 impl GeminiClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, trade_system_prompt: String) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            trade_system_prompt,
         }
     }
 
@@ -169,7 +171,7 @@ impl TradeAnalyzer for GeminiClient {
         user_prompt: &str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
         let prompt = user_prompt.to_string();
-        Box::pin(async move { self.call_gemini(SYSTEM_PROMPT, &prompt).await })
+        Box::pin(async move { self.call_gemini(&self.trade_system_prompt, &prompt).await })
     }
 
     fn generate(

@@ -230,10 +230,7 @@ impl SleeperGraphql {
             anyhow::bail!("GraphQL error fetching messages: {}", msgs.join(", "));
         }
 
-        Ok(msg_resp
-            .data
-            .and_then(|d| d.messages)
-            .unwrap_or_default())
+        Ok(msg_resp.data.and_then(|d| d.messages).unwrap_or_default())
     }
 
     /// Extract the bot's user_id from the JWT token.

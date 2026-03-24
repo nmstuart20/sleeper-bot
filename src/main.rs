@@ -41,6 +41,9 @@ enum Cli {
         /// Only process trades from the last N days
         #[arg(long, default_value = "3")]
         days: u64,
+        /// Character persona for trade analysis (e.g. "Donald Trump", "Jon Gruden", "Barack Obama")
+        #[arg(long, default_value = "Donald Trump", env = "BOT_CHARACTER")]
+        character: String,
     },
     /// Watch for trades and chat @mentions continuously
     Watch {
@@ -58,6 +61,9 @@ enum Cli {
         /// Only process trades from the last N days
         #[arg(long, default_value = "3")]
         days: u64,
+        /// Character persona for trade analysis (e.g. "Donald Trump", "Jon Gruden", "Barack Obama")
+        #[arg(long, default_value = "Donald Trump", env = "BOT_CHARACTER")]
+        character: String,
     },
     /// Debug the GraphQL connection
     Debug {
@@ -75,6 +81,9 @@ enum Cli {
         /// LLM provider to use for --chat test
         #[arg(long, value_enum, default_value = "gemini", env = "LLM_PROVIDER")]
         provider: LlmProvider,
+        /// Character persona for trade analysis
+        #[arg(long, default_value = "Donald Trump", env = "BOT_CHARACTER")]
+        character: String,
     },
 }
 
@@ -89,8 +98,9 @@ async fn main() -> Result<()> {
             post,
             provider,
             days,
+            character,
         } => {
-            let analyzer = build_analyzer(&provider)?;
+            let analyzer = build_analyzer(&provider, &character)?;
             run_check(&league, post, days, analyzer.as_ref()).await
         }
         Cli::Watch {
@@ -99,8 +109,9 @@ async fn main() -> Result<()> {
             chat_interval,
             provider,
             days,
+            character,
         } => {
-            let analyzer = build_analyzer(&provider)?;
+            let analyzer = build_analyzer(&provider, &character)?;
             run_watch(&league, interval, chat_interval, days, analyzer.as_ref()).await
         }
         Cli::Debug {
@@ -109,9 +120,10 @@ async fn main() -> Result<()> {
             chat,
             league,
             provider,
+            character,
         } => {
             let analyzer = if chat.is_some() {
-                Some(build_analyzer(&provider)?)
+                Some(build_analyzer(&provider, &character)?)
             } else {
                 None
             };
@@ -120,19 +132,21 @@ async fn main() -> Result<()> {
     }
 }
 
-fn build_analyzer(provider: &LlmProvider) -> Result<Box<dyn TradeAnalyzer>> {
+fn build_analyzer(provider: &LlmProvider, character: &str) -> Result<Box<dyn TradeAnalyzer>> {
+    let trade_prompt = llm::trade_system_prompt(character);
+    println!("Character persona: {character}");
     match provider {
         LlmProvider::Anthropic => {
             let key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
             println!("Using Anthropic (Claude) for trade analysis.");
-            Ok(Box::new(AnthropicClient::new(key)))
+            Ok(Box::new(AnthropicClient::new(key, trade_prompt)))
         }
         LlmProvider::Gemini => {
             let key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
             println!("Using Gemini for trade analysis.");
-            Ok(Box::new(GeminiClient::new(key)))
+            Ok(Box::new(GeminiClient::new(key, trade_prompt)))
         }
     }
 }
@@ -262,7 +276,10 @@ async fn chat_poll_loop(
 
     let nfl_state = sleeper.get_nfl_state().await?;
     let max_week = std::cmp::max(nfl_state.week, 1);
-    let recent_transactions = sleeper.get_all_transactions(league_id, max_week).await.unwrap_or_default();
+    let recent_transactions = sleeper
+        .get_all_transactions(league_id, max_week)
+        .await
+        .unwrap_or_default();
 
     println!("Loading league history...");
     let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
@@ -300,10 +317,11 @@ async fn chat_poll_loop(
 
                     // Skip messages from the bot itself
                     if let (Some(bot_id), Some(author_id)) = (&bot_user_id, &msg.author_id)
-                        && bot_id == author_id {
-                            chat_state.mark_responded(msg_id)?;
-                            continue;
-                        }
+                        && bot_id == author_id
+                    {
+                        chat_state.mark_responded(msg_id)?;
+                        continue;
+                    }
 
                     if !chat::is_mention(text) {
                         continue;
@@ -381,7 +399,10 @@ async fn run_debug(
 
         let nfl_state = sleeper.get_nfl_state().await?;
         let max_week = std::cmp::max(nfl_state.week, 1);
-        let recent_transactions = sleeper.get_all_transactions(&league_id, max_week).await.unwrap_or_default();
+        let recent_transactions = sleeper
+            .get_all_transactions(&league_id, max_week)
+            .await
+            .unwrap_or_default();
 
         println!("Loading league history...");
         let (champions, all_time_stats) = sleeper.fetch_league_history(&league_id).await;
@@ -403,7 +424,8 @@ async fn run_debug(
             println!("Search results found.\n");
         }
 
-        let prompt = chat::build_chat_prompt("debug_user", &question, &league_context, &search_results);
+        let prompt =
+            chat::build_chat_prompt("debug_user", &question, &league_context, &search_results);
 
         println!("Generating response...");
         let response = analyzer.generate(llm::CHAT_SYSTEM_PROMPT, &prompt).await?;

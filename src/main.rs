@@ -122,11 +122,14 @@ async fn main() -> Result<()> {
             character,
         } => {
             println!("Character persona: {character}");
+            let watch_config = WatchConfig {
+                chat_interval,
+                trade_interval: interval,
+                days,
+            };
             run_watch(
                 &league,
-                interval,
-                chat_interval,
-                days,
+                watch_config,
                 league_rules,
                 &config.league.scoring,
                 &config.league.bot_username,
@@ -212,11 +215,15 @@ async fn run_check(
     .await
 }
 
-async fn run_watch(
-    league_id: &str,
+struct WatchConfig {
     trade_interval: u64,
     chat_interval: u64,
     days: u64,
+}
+
+async fn run_watch(
+    league_id: &str,
+    watch_config: WatchConfig,
     league_rules: &str,
     scoring: &str,
     bot_username: &str,
@@ -232,6 +239,10 @@ async fn run_watch(
 
     let trade_agent =
         build_agent_runner(provider, &llm::trade_system_prompt(character, league_rules))?;
+
+    let trade_interval = watch_config.trade_interval;
+    let chat_interval = watch_config.chat_interval;
+    let days = watch_config.days;
 
     println!(
         "Watching league {league_id} — trades every {trade_interval}s, chat every {chat_interval}s. Press Ctrl+C to stop."

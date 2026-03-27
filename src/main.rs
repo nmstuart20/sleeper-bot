@@ -530,7 +530,7 @@ async fn run_debug(
         println!("Loading league data...");
         let mut sleeper = SleeperClient::new();
         let _league_data = sleeper.get_league(&league_id).await?;
-        let users = sleeper.get_users(&league_id).await?;
+        let users: Vec<sleeper::User> = sleeper.get_users(&league_id).await?;
         let rosters = sleeper.get_rosters(&league_id).await?;
         let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
         let roster_names = sleeper::build_roster_name_map(&users, &rosters);

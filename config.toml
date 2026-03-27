@@ -3,3 +3,5 @@
 rules = "10 team superflex, full ppr league with deep 14 player benches, 2 IR spots and 3 taxi spots"
 # Scoring format for fantasy points: "half_ppr", "ppr", or "std"
 scoring = "ppr"
+# Bot's Sleeper username — used to detect @mentions in chat
+bot_username = "tradegimp210"

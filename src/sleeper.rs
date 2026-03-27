@@ -316,6 +316,16 @@ impl League {
     }
 }
 
+/// A single weekly matchup entry from the Sleeper API.
+#[derive(Debug, Deserialize)]
+pub struct Matchup {
+    pub roster_id: u32,
+    pub matchup_id: Option<u32>,
+    pub points: Option<f64>,
+    pub starters: Option<Vec<String>>,
+    pub starters_points: Option<Vec<f64>>,
+}
+
 /// A single matchup entry in a playoff bracket.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -567,6 +577,11 @@ impl SleeperClient {
 
     pub async fn get_winners_bracket(&self, league_id: &str) -> Result<Vec<BracketMatch>> {
         self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/winners_bracket"))
+            .await
+    }
+
+    pub async fn get_matchups(&self, league_id: &str, week: u32) -> Result<Vec<Matchup>> {
+        self.get_json_with_retry(&format!("{BASE_URL}/league/{league_id}/matchups/{week}"))
             .await
     }
 

@@ -12,10 +12,16 @@ pub struct LeagueConfig {
     pub rules: String,
     #[serde(default = "default_scoring")]
     pub scoring: String,
+    #[serde(default = "default_bot_username")]
+    pub bot_username: String,
 }
 
 fn default_scoring() -> String {
     "half_ppr".to_string()
+}
+
+fn default_bot_username() -> String {
+    "tradegimp210".to_string()
 }
 
 impl Config {

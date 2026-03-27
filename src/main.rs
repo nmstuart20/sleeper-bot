@@ -41,7 +41,7 @@ enum Cli {
         #[arg(long, value_enum, default_value = "anthropic", env = "LLM_PROVIDER")]
         provider: LlmProvider,
         /// Only process trades from the last N days
-        #[arg(long, default_value = "3")]
+        #[arg(long, default_value = "10")]
         days: u64,
         /// Character persona for trade analysis (e.g. "Donald Trump", "Jon Gruden", "Barack Obama")
         #[arg(long, default_value = "Donald Trump", env = "BOT_CHARACTER")]
@@ -107,7 +107,10 @@ async fn main() -> Result<()> {
             character,
         } => {
             println!("Character persona: {character}");
-            let trade_agent = build_agent_runner(&provider, &llm::trade_system_prompt(&character, league_rules))?;
+            let trade_agent = build_agent_runner(
+                &provider,
+                &llm::trade_system_prompt(&character, league_rules),
+            )?;
             run_check(&league, post, days, &trade_agent, &config.league.scoring).await
         }
         Cli::Watch {
@@ -159,12 +162,18 @@ fn build_agent_runner(provider: &LlmProvider, system_prompt: &str) -> Result<Age
         LlmProvider::Anthropic => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-            Ok(AgentRunner::Anthropic(ChatAgent::new(api_key, system_prompt.to_string())))
+            Ok(AgentRunner::Anthropic(ChatAgent::new(
+                api_key,
+                system_prompt.to_string(),
+            )))
         }
         LlmProvider::Gemini => {
             let api_key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
-            Ok(AgentRunner::Gemini(GeminiChatAgent::new(api_key, system_prompt.to_string())))
+            Ok(AgentRunner::Gemini(GeminiChatAgent::new(
+                api_key,
+                system_prompt.to_string(),
+            )))
         }
     }
 }
@@ -221,7 +230,8 @@ async fn run_watch(
         }
     };
 
-    let trade_agent = build_agent_runner(provider, &llm::trade_system_prompt(character, league_rules))?;
+    let trade_agent =
+        build_agent_runner(provider, &llm::trade_system_prompt(character, league_rules))?;
 
     println!(
         "Watching league {league_id} — trades every {trade_interval}s, chat every {chat_interval}s. Press Ctrl+C to stop."
@@ -291,9 +301,16 @@ enum AgentRunner {
 }
 
 impl AgentRunner {
-    async fn run(&self, user_message: &str, executor: &ToolExecutor<'_>, max_iterations: u32) -> Result<String> {
+    async fn run(
+        &self,
+        user_message: &str,
+        executor: &ToolExecutor<'_>,
+        max_iterations: u32,
+    ) -> Result<String> {
         match self {
-            AgentRunner::Anthropic(agent) => agent.run(user_message, executor, max_iterations).await,
+            AgentRunner::Anthropic(agent) => {
+                agent.run(user_message, executor, max_iterations).await
+            }
             AgentRunner::Gemini(agent) => agent.run(user_message, executor, max_iterations).await,
         }
     }
@@ -552,13 +569,8 @@ async fn run_debug(
             recent_transactions: &recent_transactions,
         };
 
-        let lightweight_ctx = chat::build_lightweight_context(
-            &_league_data,
-            &users,
-            &rosters,
-            &nfl_state,
-            scoring,
-        );
+        let lightweight_ctx =
+            chat::build_lightweight_context(&_league_data, &users, &rosters, &nfl_state, scoring);
         let user_msg = format!(
             "League context: {lightweight_ctx}\n\n\
              debug_user tagged you in the league chat and said:\n\"{question}\""

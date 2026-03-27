@@ -121,11 +121,9 @@ impl GeminiChatAgent {
                 "required": ["query"]
             }
         }));
-        let tools = vec![
-            serde_json::json!({
-                "function_declarations": function_declarations
-            }),
-        ];
+        let tools = vec![serde_json::json!({
+            "function_declarations": function_declarations
+        })];
         Self {
             api_key,
             client: reqwest::Client::new(),
@@ -169,10 +167,7 @@ impl GeminiChatAgent {
                 .and_then(|c| c.first())
                 .ok_or_else(|| anyhow::anyhow!("Gemini returned no candidates"))?;
 
-            let finish_reason = candidate
-                .finish_reason
-                .as_deref()
-                .unwrap_or("UNKNOWN");
+            let finish_reason = candidate.finish_reason.as_deref().unwrap_or("UNKNOWN");
 
             let parts = candidate
                 .content
@@ -192,7 +187,10 @@ impl GeminiChatAgent {
                 let text = extract_text(&parts);
                 eprintln!(
                     "Gemini agent completed in {} iteration(s), {} tool call(s), {} input tokens, {} output tokens",
-                    iteration + 1, total_tool_calls, total_input_tokens, total_output_tokens
+                    iteration + 1,
+                    total_tool_calls,
+                    total_input_tokens,
+                    total_output_tokens
                 );
                 return Ok(text);
             }
@@ -223,18 +221,20 @@ impl GeminiChatAgent {
 
                 let result = if fc.name == "web_search" {
                     // Handle web_search client-side via Google News RSS
-                    let query = fc.args.get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let query = fc.args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                     let output = news::web_search(query).await;
                     serde_json::json!({ "content": output })
                 } else {
                     match tools::parse_tool_call(&fc.name, &fc.args) {
                         Ok(tool_name) => match executor.execute(&tool_name).await {
                             Ok(output) => serde_json::json!({ "content": output }),
-                            Err(e) => serde_json::json!({ "error": format!("Error executing tool: {e}") }),
+                            Err(e) => {
+                                serde_json::json!({ "error": format!("Error executing tool: {e}") })
+                            }
                         },
-                        Err(e) => serde_json::json!({ "error": format!("Error parsing tool call: {e}") }),
+                        Err(e) => {
+                            serde_json::json!({ "error": format!("Error parsing tool call: {e}") })
+                        }
                     }
                 };
 
@@ -388,7 +388,10 @@ mod tests {
         let json = serde_json::to_value(&part).unwrap();
         assert!(json.get("text").is_none());
         assert_eq!(json["functionResponse"]["name"], "get_league_standings");
-        assert_eq!(json["functionResponse"]["response"]["content"], "1. Nick — 8-2");
+        assert_eq!(
+            json["functionResponse"]["response"]["content"],
+            "1. Nick — 8-2"
+        );
     }
 
     #[test]
@@ -456,7 +459,13 @@ mod tests {
         let resp: GeminiResponse = serde_json::from_str(json).unwrap();
         let candidate = resp.candidates.unwrap();
         assert_eq!(candidate[0].finish_reason.as_deref(), Some("STOP"));
-        let parts = candidate[0].content.as_ref().unwrap().parts.as_ref().unwrap();
+        let parts = candidate[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .parts
+            .as_ref()
+            .unwrap();
         assert_eq!(extract_text(parts), "The standings show Nick is first.");
         assert_eq!(resp.usage_metadata.unwrap().prompt_token_count, 100);
     }

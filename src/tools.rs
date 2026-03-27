@@ -604,9 +604,10 @@ impl<'a> ToolExecutor<'a> {
                     return None;
                 }
                 if let Some(filter_pos) = position
-                    && !pos.eq_ignore_ascii_case(filter_pos) {
-                        return None;
-                    }
+                    && !pos.eq_ignore_ascii_case(filter_pos)
+                {
+                    return None;
+                }
                 let team = player.team.as_deref().unwrap_or("FA");
                 Some((player.full_name(), pos, team, pts))
             })
@@ -658,9 +659,10 @@ impl<'a> ToolExecutor<'a> {
 
             // Filter by type if requested
             if let Some(filter) = tx_type
-                && !this_type.eq_ignore_ascii_case(filter) {
-                    continue;
-                }
+                && !this_type.eq_ignore_ascii_case(filter)
+            {
+                continue;
+            }
 
             let team = tx
                 .roster_ids
@@ -990,55 +992,57 @@ impl<'a> ToolExecutor<'a> {
 
         // Playoff bracket
         if let Ok(bracket) = self.sleeper.get_winners_bracket(&league_id).await
-            && !bracket.is_empty() {
-                // Build roster_id → name map for bracket
-                let rid_to_name: HashMap<u32, &str> = roster_names
-                    .iter()
-                    .map(|(id, name)| (*id, name.as_str()))
-                    .collect();
+            && !bracket.is_empty()
+        {
+            // Build roster_id → name map for bracket
+            let rid_to_name: HashMap<u32, &str> = roster_names
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .collect();
 
-                // Group by round
-                let max_round = bracket.iter().map(|b| b.r).max().unwrap_or(0);
+            // Group by round
+            let max_round = bracket.iter().map(|b| b.r).max().unwrap_or(0);
 
-                result.push_str("\nPlayoff Bracket:\n");
-                for round in 1..=max_round {
-                    let round_label = if round == max_round {
-                        "Championship".to_string()
-                    } else if round == max_round - 1 && max_round > 2 {
-                        "Semifinals".to_string()
-                    } else {
-                        format!("Round {round}")
-                    };
-                    result.push_str(&format!("  {round_label}:\n"));
+            result.push_str("\nPlayoff Bracket:\n");
+            for round in 1..=max_round {
+                let round_label = if round == max_round {
+                    "Championship".to_string()
+                } else if round == max_round - 1 && max_round > 2 {
+                    "Semifinals".to_string()
+                } else {
+                    format!("Round {round}")
+                };
+                result.push_str(&format!("  {round_label}:\n"));
 
-                    let mut matches: Vec<_> = bracket.iter().filter(|b| b.r == round).collect();
-                    matches.sort_by_key(|b| b.m);
+                let mut matches: Vec<_> = bracket.iter().filter(|b| b.r == round).collect();
+                matches.sort_by_key(|b| b.m);
 
-                    for m in matches {
-                        let t1 =
-                            m.t1.and_then(|id| rid_to_name.get(&id).copied())
-                                .unwrap_or("TBD");
-                        let t2 =
-                            m.t2.and_then(|id| rid_to_name.get(&id).copied())
-                                .unwrap_or("TBD");
-                        let winner = m.w.and_then(|id| rid_to_name.get(&id).copied());
+                for m in matches {
+                    let t1 =
+                        m.t1.and_then(|id| rid_to_name.get(&id).copied())
+                            .unwrap_or("TBD");
+                    let t2 =
+                        m.t2.and_then(|id| rid_to_name.get(&id).copied())
+                            .unwrap_or("TBD");
+                    let winner = m.w.and_then(|id| rid_to_name.get(&id).copied());
 
-                        let mut line = format!("    {t1} vs {t2}");
-                        if let Some(w) = winner {
-                            line.push_str(&format!(" → Winner: {w}"));
-                        }
-                        result.push_str(&line);
-                        result.push('\n');
+                    let mut line = format!("    {t1} vs {t2}");
+                    if let Some(w) = winner {
+                        line.push_str(&format!(" → Winner: {w}"));
                     }
+                    result.push_str(&line);
+                    result.push('\n');
                 }
-
-                // Highlight champion
-                if let Some(champ_match) = bracket.iter().find(|b| b.r == max_round && b.m == 1)
-                    && let Some(winner_id) = champ_match.w {
-                        let champ = rid_to_name.get(&winner_id).copied().unwrap_or("Unknown");
-                        result.push_str(&format!("\nChampion: {champ}\n"));
-                    }
             }
+
+            // Highlight champion
+            if let Some(champ_match) = bracket.iter().find(|b| b.r == max_round && b.m == 1)
+                && let Some(winner_id) = champ_match.w
+            {
+                let champ = rid_to_name.get(&winner_id).copied().unwrap_or("Unknown");
+                result.push_str(&format!("\nChampion: {champ}\n"));
+            }
+        }
 
         Ok(result)
     }

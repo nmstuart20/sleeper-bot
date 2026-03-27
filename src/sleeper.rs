@@ -75,7 +75,7 @@ impl RosterSettings {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct Transaction {
     #[serde(rename = "type")]
@@ -100,7 +100,7 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct DraftPick {
     pub season: Option<String>,
@@ -150,170 +150,6 @@ pub struct LeagueSettings {
     #[serde(rename = "type")]
     pub league_type: Option<u32>,
     pub position_limit_qb: Option<u32>,
-}
-
-impl League {
-    /// Format the league settings and rules into a human-readable context string.
-    pub fn format_settings_context(&self) -> String {
-        let mut lines = Vec::new();
-
-        if let Some(name) = &self.name {
-            lines.push(format!("League: {name}"));
-        }
-
-        let num_teams = self.total_rosters.unwrap_or(0);
-        if num_teams > 0 {
-            lines.push(format!("Teams: {num_teams}"));
-        }
-
-        // League type
-        if let Some(settings) = &self.settings {
-            let league_type = match settings.league_type {
-                Some(0) => "Redraft",
-                Some(1) => "Keeper",
-                Some(2) => "Dynasty",
-                _ => "Unknown",
-            };
-            lines.push(format!("Type: {league_type}"));
-        }
-
-        // Roster positions
-        if let Some(positions) = &self.roster_positions {
-            let starters: Vec<&String> = positions.iter().filter(|p| *p != "BN").collect();
-            // Count each position
-            let mut pos_counts: Vec<(String, usize)> = Vec::new();
-            for pos in &starters {
-                if let Some(entry) = pos_counts.iter_mut().find(|(p, _)| p == *pos) {
-                    entry.1 += 1;
-                } else {
-                    pos_counts.push((pos.to_string(), 1));
-                }
-            }
-            let pos_str: Vec<String> = pos_counts
-                .iter()
-                .map(|(p, c)| if *c > 1 { format!("{c}{p}") } else { p.clone() })
-                .collect();
-            let bench_count = positions.iter().filter(|p| *p == "BN").count();
-            lines.push(format!("Starters: {}", pos_str.join(", ")));
-            lines.push(format!("Bench spots: {bench_count}"));
-        }
-
-        // Key settings
-        if let Some(settings) = &self.settings {
-            if let Some(taxi) = settings.taxi_slots
-                && taxi > 0
-            {
-                let years = settings.taxi_years.unwrap_or(0);
-                let vets = settings.taxi_allow_vets.unwrap_or(0) == 1;
-                let mut taxi_str = format!("Taxi squad: {taxi} slots");
-                if years > 0 {
-                    taxi_str.push_str(&format!(", {years}-year eligibility"));
-                }
-                if vets {
-                    taxi_str.push_str(", vets allowed");
-                }
-                lines.push(taxi_str);
-            }
-            if let Some(ir) = settings.reserve_slots
-                && ir > 0
-            {
-                lines.push(format!("IR slots: {ir}"));
-            }
-            if let Some(playoffs) = settings.playoff_teams {
-                lines.push(format!("Playoff teams: {playoffs}"));
-            }
-            if let Some(week) = settings.playoff_week_start {
-                lines.push(format!("Playoffs start: Week {week}"));
-            }
-            if let Some(deadline) = settings.trade_deadline
-                && deadline > 0
-            {
-                lines.push(format!("Trade deadline: Week {deadline}"));
-            }
-            if let Some(review) = settings.trade_review_days {
-                lines.push(format!("Trade review period: {review} day(s)"));
-            }
-            if settings.pick_trading.unwrap_or(0) == 1 {
-                lines.push("Pick trading: Enabled".to_string());
-            }
-            // Waiver type
-            let waiver_desc = match settings.waiver_type {
-                Some(0) => Some("Rolling waivers (no FAAB)"),
-                Some(1) => Some("Rolling waivers with reversals"),
-                Some(2) => Some("FAAB (free agent auction budget)"),
-                _ => None,
-            };
-            if let Some(desc) = waiver_desc {
-                let mut w = desc.to_string();
-                if settings.waiver_type == Some(2)
-                    && let Some(budget) = settings.waiver_budget
-                {
-                    w.push_str(&format!(", ${budget} budget"));
-                }
-                lines.push(format!("Waivers: {w}"));
-            }
-            if settings.best_ball.unwrap_or(0) == 1 {
-                lines.push("Format: Best ball".to_string());
-            }
-        }
-
-        // Scoring settings
-        if let Some(scoring) = &self.scoring_settings {
-            let mut scoring_highlights = Vec::new();
-
-            if let Some(v) = scoring.get("rec") {
-                let label = if *v == 1.0 {
-                    "Full PPR"
-                } else if *v == 0.5 {
-                    "Half PPR"
-                } else if *v == 0.0 {
-                    "Standard (non-PPR)"
-                } else {
-                    ""
-                };
-                if !label.is_empty() {
-                    scoring_highlights.push(label.to_string());
-                } else {
-                    scoring_highlights.push(format!("{v} PPR"));
-                }
-            }
-            if let Some(v) = scoring.get("pass_td") {
-                scoring_highlights.push(format!("{v:.0}-pt passing TDs"));
-            }
-            if let Some(v) = scoring.get("pass_int") {
-                scoring_highlights.push(format!("{v:.0} per INT thrown"));
-            }
-            if let Some(v) = scoring.get("pass_yd") {
-                let per_yd = if *v > 0.0 { 1.0 / v } else { 0.0 };
-                scoring_highlights.push(format!("1 pt per {per_yd:.0} pass yds"));
-            }
-            if let Some(v) = scoring.get("rush_yd") {
-                let per_yd = if *v > 0.0 { 1.0 / v } else { 0.0 };
-                scoring_highlights.push(format!("1 pt per {per_yd:.0} rush yds"));
-            }
-            if let Some(v) = scoring.get("rec_yd") {
-                let per_yd = if *v > 0.0 { 1.0 / v } else { 0.0 };
-                scoring_highlights.push(format!("1 pt per {per_yd:.0} rec yds"));
-            }
-            if let Some(v) = scoring.get("fum_lost") {
-                scoring_highlights.push(format!("{v:.0} per fumble lost"));
-            }
-
-            if !scoring_highlights.is_empty() {
-                lines.push(format!("Scoring: {}", scoring_highlights.join(", ")));
-            }
-        }
-
-        if lines.is_empty() {
-            return String::new();
-        }
-
-        let mut result = String::from("LEAGUE SETTINGS:\n");
-        for line in &lines {
-            result.push_str(&format!("  {line}\n"));
-        }
-        result
-    }
 }
 
 /// A single weekly matchup entry from the Sleeper API.

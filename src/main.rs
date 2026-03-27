@@ -1,8 +1,7 @@
 mod agent;
-mod anthropic;
 mod chat;
 mod config;
-mod gemini;
+mod gemini_agent;
 mod graphql;
 mod llm;
 mod news;
@@ -16,10 +15,8 @@ use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
 
 use crate::agent::ChatAgent;
-use crate::anthropic::AnthropicClient;
-use crate::gemini::GeminiClient;
+use crate::gemini_agent::GeminiChatAgent;
 use crate::graphql::SleeperGraphql;
-use crate::llm::TradeAnalyzer;
 use crate::sleeper::{Player, SleeperClient};
 use crate::state::{ChatState, ReviewState};
 use crate::tools::ToolExecutor;
@@ -109,8 +106,9 @@ async fn main() -> Result<()> {
             days,
             character,
         } => {
-            let analyzer = build_analyzer(&provider, &character, league_rules)?;
-            run_check(&league, post, days, analyzer.as_ref()).await
+            println!("Character persona: {character}");
+            let trade_agent = build_agent_runner(&provider, &llm::trade_system_prompt(&character, league_rules))?;
+            run_check(&league, post, days, &trade_agent, &config.league.scoring).await
         }
         Cli::Watch {
             league,
@@ -120,7 +118,7 @@ async fn main() -> Result<()> {
             days,
             character,
         } => {
-            let analyzer = build_analyzer(&provider, &character, league_rules)?;
+            println!("Character persona: {character}");
             run_watch(
                 &league,
                 interval,
@@ -130,7 +128,7 @@ async fn main() -> Result<()> {
                 &config.league.scoring,
                 &config.league.bot_username,
                 &provider,
-                analyzer.as_ref(),
+                &character,
             )
             .await
         }
@@ -140,13 +138,8 @@ async fn main() -> Result<()> {
             chat,
             league,
             provider,
-            character,
+            character: _,
         } => {
-            let analyzer = if chat.is_some() {
-                Some(build_analyzer(&provider, &character, league_rules)?)
-            } else {
-                None
-            };
             run_debug(
                 check_token,
                 send,
@@ -155,32 +148,23 @@ async fn main() -> Result<()> {
                 league_rules,
                 &config.league.scoring,
                 &provider,
-                analyzer.as_deref(),
             )
             .await
         }
     }
 }
 
-fn build_analyzer(
-    provider: &LlmProvider,
-    character: &str,
-    league_rules: &str,
-) -> Result<Box<dyn TradeAnalyzer>> {
-    let trade_prompt = llm::trade_system_prompt(character, league_rules);
-    println!("Character persona: {character}");
+fn build_agent_runner(provider: &LlmProvider, system_prompt: &str) -> Result<AgentRunner> {
     match provider {
         LlmProvider::Anthropic => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-            println!("Using Anthropic (Claude) for trade analysis.");
-            Ok(Box::new(AnthropicClient::new(key, trade_prompt)))
+            Ok(AgentRunner::Anthropic(ChatAgent::new(api_key, system_prompt.to_string())))
         }
         LlmProvider::Gemini => {
-            let key = std::env::var("GEMINI_API_KEY")
+            let api_key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
-            println!("Using Gemini for trade analysis.");
-            Ok(Box::new(GeminiClient::new(key, trade_prompt)))
+            Ok(AgentRunner::Gemini(GeminiChatAgent::new(api_key, system_prompt.to_string())))
         }
     }
 }
@@ -189,7 +173,8 @@ async fn run_check(
     league_id: &str,
     post: bool,
     days: u64,
-    analyzer: &dyn TradeAnalyzer,
+    agent: &AgentRunner,
+    scoring: &str,
 ) -> Result<()> {
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
@@ -209,10 +194,11 @@ async fn run_check(
     process_trades(
         league_id,
         &mut sleeper,
-        analyzer,
+        agent,
         gql.as_ref(),
         &mut review_state,
         days,
+        scoring,
     )
     .await
 }
@@ -226,7 +212,7 @@ async fn run_watch(
     scoring: &str,
     bot_username: &str,
     provider: &LlmProvider,
-    analyzer: &dyn TradeAnalyzer,
+    character: &str,
 ) -> Result<()> {
     let gql = match setup_graphql() {
         Ok(g) => g,
@@ -235,11 +221,13 @@ async fn run_watch(
         }
     };
 
+    let trade_agent = build_agent_runner(provider, &llm::trade_system_prompt(character, league_rules))?;
+
     println!(
         "Watching league {league_id} — trades every {trade_interval}s, chat every {chat_interval}s. Press Ctrl+C to stop."
     );
 
-    let trade_loop = trade_poll_loop(league_id, trade_interval, days, analyzer, &gql);
+    let trade_loop = trade_poll_loop(league_id, trade_interval, days, &trade_agent, &gql, scoring);
     let chat_loop = chat_poll_loop(
         league_id,
         chat_interval,
@@ -247,7 +235,6 @@ async fn run_watch(
         scoring,
         bot_username,
         provider,
-        analyzer,
         &gql,
     );
 
@@ -272,8 +259,9 @@ async fn trade_poll_loop(
     league_id: &str,
     interval: u64,
     days: u64,
-    analyzer: &dyn TradeAnalyzer,
+    agent: &AgentRunner,
     gql: &SleeperGraphql,
+    scoring: &str,
 ) -> Result<()> {
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
@@ -282,16 +270,32 @@ async fn trade_poll_loop(
         if let Err(e) = process_trades(
             league_id,
             &mut sleeper,
-            analyzer,
+            agent,
             Some(gql),
             &mut review_state,
             days,
+            scoring,
         )
         .await
         {
             eprintln!("Error during trade poll: {e}");
         }
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
+}
+
+/// Wraps either agent type so the chat loop doesn't branch on provider.
+enum AgentRunner {
+    Anthropic(ChatAgent),
+    Gemini(GeminiChatAgent),
+}
+
+impl AgentRunner {
+    async fn run(&self, user_message: &str, executor: &ToolExecutor<'_>, max_iterations: u32) -> Result<String> {
+        match self {
+            AgentRunner::Anthropic(agent) => agent.run(user_message, executor, max_iterations).await,
+            AgentRunner::Gemini(agent) => agent.run(user_message, executor, max_iterations).await,
+        }
     }
 }
 
@@ -302,16 +306,8 @@ async fn chat_poll_loop(
     scoring: &str,
     bot_username: &str,
     provider: &LlmProvider,
-    analyzer: &dyn TradeAnalyzer,
     gql: &SleeperGraphql,
 ) -> Result<()> {
-    let use_agent = matches!(provider, LlmProvider::Anthropic);
-    if !use_agent {
-        eprintln!(
-            "Warning: tool-use agent mode requires Anthropic. Falling back to legacy single-shot mode for Gemini."
-        );
-    }
-
     let bot_user_id = gql.bot_user_id();
 
     if let Some(ref id) = bot_user_id {
@@ -345,32 +341,20 @@ async fn chat_poll_loop(
     println!("Loading player stats and projections...");
     let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
-    // Set up agent (Anthropic) or legacy context (Gemini)
-    let chat_agent = if use_agent {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-        let sys = llm::chat_system_prompt(league_rules);
-        Some(ChatAgent::new(api_key, sys))
-    } else {
-        None
-    };
-
-    // Legacy context only needed for Gemini fallback
-    let legacy_context = if !use_agent {
-        Some(chat::build_league_context(&chat::LeagueContextParams {
-            users: &users,
-            rosters: &rosters,
-            players: &players,
-            recent_transactions: &recent_transactions,
-            roster_names: &roster_names,
-            champions: &champions,
-            all_time_stats: &all_time_stats,
-            projections: &projections,
-            scoring,
-            league: Some(&_league),
-        }))
-    } else {
-        None
+    // Set up agent for the chosen provider
+    let agent = match provider {
+        LlmProvider::Anthropic => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+            let sys = llm::chat_system_prompt(league_rules);
+            AgentRunner::Anthropic(ChatAgent::new(api_key, sys))
+        }
+        LlmProvider::Gemini => {
+            let api_key = std::env::var("GEMINI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+            let sys = llm::chat_system_prompt(league_rules);
+            AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys))
+        }
     };
 
     loop {
@@ -411,70 +395,47 @@ async fn chat_poll_loop(
 
                     println!("\nMention from {author}: \"{text}\"");
 
-                    let response = if let Some(ref agent) = chat_agent {
-                        // Agent mode (Anthropic): use tool-calling loop
-                        let executor = ToolExecutor {
-                            sleeper: &sleeper,
-                            league_id,
-                            players: &players,
-                            users: &users,
-                            rosters: &rosters,
-                            roster_names: &roster_names,
-                            nfl_state: &nfl_state,
-                            historical_stats: &historical_stats,
-                            projections: &projections,
-                            champions: &champions,
-                            all_time_stats: &all_time_stats,
-                            scoring,
-                            recent_transactions: &recent_transactions,
-                        };
-
-                        let lightweight_ctx = chat::build_lightweight_context(
-                            &_league, &users, &rosters, &nfl_state, scoring,
-                        );
-
-                        // Prepend recent conversation history for follow-up context
-                        let author_id = msg.author_id.as_deref().unwrap_or("");
-                        let history = chat_state.get_exchanges(author_id);
-                        let history_str = if history.is_empty() {
-                            String::new()
-                        } else {
-                            let mut h = String::from("Recent conversation with this user:\n");
-                            for (q, a) in &history {
-                                h.push_str(&format!("User: {q}\nYou: {a}\n\n"));
-                            }
-                            h
-                        };
-
-                        let user_msg = format!(
-                            "League context: {lightweight_ctx}\n\n\
-                             {history_str}\
-                             {author} tagged you in the league chat and said:\n\"{question}\""
-                        );
-
-                        println!("Running agent...");
-                        agent.run(&user_msg, &executor, 10).await
-                    } else {
-                        // Legacy mode (Gemini): single-shot with stuffed context
-                        let league_context = legacy_context.as_deref().unwrap_or("");
-                        let player_context = chat::find_mentioned_players(
-                            &question,
-                            &players,
-                            &historical_stats,
-                            &projections,
-                            scoring,
-                        );
-                        let search_results = chat::search_for_context(&question).await;
-                        let prompt = chat::build_chat_prompt(
-                            author,
-                            &question,
-                            league_context,
-                            &search_results,
-                            &player_context,
-                        );
-                        let chat_sys = llm::chat_system_prompt_legacy(league_rules);
-                        analyzer.generate(&chat_sys, &prompt).await
+                    let executor = ToolExecutor {
+                        sleeper: &sleeper,
+                        league_id,
+                        players: &players,
+                        users: &users,
+                        rosters: &rosters,
+                        roster_names: &roster_names,
+                        nfl_state: &nfl_state,
+                        historical_stats: &historical_stats,
+                        projections: &projections,
+                        champions: &champions,
+                        all_time_stats: &all_time_stats,
+                        scoring,
+                        recent_transactions: &recent_transactions,
                     };
+
+                    let lightweight_ctx = chat::build_lightweight_context(
+                        &_league, &users, &rosters, &nfl_state, scoring,
+                    );
+
+                    // Prepend recent conversation history for follow-up context
+                    let author_id = msg.author_id.as_deref().unwrap_or("");
+                    let history = chat_state.get_exchanges(author_id);
+                    let history_str = if history.is_empty() {
+                        String::new()
+                    } else {
+                        let mut h = String::from("Recent conversation with this user:\n");
+                        for (q, a) in &history {
+                            h.push_str(&format!("User: {q}\nYou: {a}\n\n"));
+                        }
+                        h
+                    };
+
+                    let user_msg = format!(
+                        "League context: {lightweight_ctx}\n\n\
+                         {history_str}\
+                         {author} tagged you in the league chat and said:\n\"{question}\""
+                    );
+
+                    println!("Running agent...");
+                    let response = agent.run(&user_msg, &executor, 10).await;
 
                     let resp_author_id = msg.author_id.as_deref().unwrap_or("");
                     match response {
@@ -524,7 +485,6 @@ async fn run_debug(
     league_rules: &str,
     scoring: &str,
     provider: &LlmProvider,
-    analyzer: Option<&dyn TradeAnalyzer>,
 ) -> Result<()> {
     if check_token {
         println!("Checking SLEEPER_TOKEN...");
@@ -538,13 +498,6 @@ async fn run_debug(
         }
     } else if let Some(question) = chat_question {
         let league_id = league.ok_or_else(|| anyhow::anyhow!("--league required with --chat"))?;
-        let use_agent = matches!(provider, LlmProvider::Anthropic);
-
-        if !use_agent {
-            eprintln!(
-                "Warning: tool-use agent mode requires Anthropic. Using legacy single-shot mode for Gemini."
-            );
-        }
 
         println!("Loading league data...");
         let mut sleeper = SleeperClient::new();
@@ -568,91 +521,51 @@ async fn run_debug(
         let (historical_stats, projections) =
             sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
-        let response = if use_agent {
-            // Agent mode (Anthropic)
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-            let sys = llm::chat_system_prompt(league_rules);
-            let agent = ChatAgent::new(api_key, sys);
-
-            let executor = ToolExecutor {
-                sleeper: &sleeper,
-                league_id: &league_id,
-                players: &players,
-                users: &users,
-                rosters: &rosters,
-                roster_names: &roster_names,
-                nfl_state: &nfl_state,
-                historical_stats: &historical_stats,
-                projections: &projections,
-                champions: &champions,
-                all_time_stats: &all_time_stats,
-                scoring,
-                recent_transactions: &recent_transactions,
-            };
-
-            let lightweight_ctx = chat::build_lightweight_context(
-                &_league_data,
-                &users,
-                &rosters,
-                &nfl_state,
-                scoring,
-            );
-            let user_msg = format!(
-                "League context: {lightweight_ctx}\n\n\
-                 debug_user tagged you in the league chat and said:\n\"{question}\""
-            );
-
-            println!("Running agent (tool calls will be printed to stderr)...");
-            agent.run(&user_msg, &executor, 10).await?
-        } else {
-            // Legacy mode (Gemini)
-            let analyzer = analyzer.ok_or_else(|| anyhow::anyhow!("analyzer not initialized"))?;
-
-            let league_context = chat::build_league_context(&chat::LeagueContextParams {
-                users: &users,
-                rosters: &rosters,
-                players: &players,
-                recent_transactions: &recent_transactions,
-                roster_names: &roster_names,
-                champions: &champions,
-                all_time_stats: &all_time_stats,
-                projections: &projections,
-                scoring,
-                league: Some(&_league_data),
-            });
-
-            println!("\n--- League Context ---\n{league_context}\n---\n");
-
-            let player_context = chat::find_mentioned_players(
-                &question,
-                &players,
-                &historical_stats,
-                &projections,
-                scoring,
-            );
-            if !player_context.is_empty() {
-                println!("{player_context}");
+        let agent = match provider {
+            LlmProvider::Anthropic => {
+                let api_key = std::env::var("ANTHROPIC_API_KEY")
+                    .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+                let sys = llm::chat_system_prompt(league_rules);
+                AgentRunner::Anthropic(ChatAgent::new(api_key, sys))
             }
-
-            println!("Searching for context on: \"{question}\"");
-            let search_results = chat::search_for_context(&question).await;
-            if !search_results.is_empty() {
-                println!("Search results found.\n");
+            LlmProvider::Gemini => {
+                let api_key = std::env::var("GEMINI_API_KEY")
+                    .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+                let sys = llm::chat_system_prompt(league_rules);
+                AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys))
             }
-
-            let prompt = chat::build_chat_prompt(
-                "debug_user",
-                &question,
-                &league_context,
-                &search_results,
-                &player_context,
-            );
-
-            println!("Generating response...");
-            let chat_sys = llm::chat_system_prompt_legacy(league_rules);
-            analyzer.generate(&chat_sys, &prompt).await?
         };
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: &league_id,
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring,
+            recent_transactions: &recent_transactions,
+        };
+
+        let lightweight_ctx = chat::build_lightweight_context(
+            &_league_data,
+            &users,
+            &rosters,
+            &nfl_state,
+            scoring,
+        );
+        let user_msg = format!(
+            "League context: {lightweight_ctx}\n\n\
+             debug_user tagged you in the league chat and said:\n\"{question}\""
+        );
+
+        println!("Running agent (tool calls will be printed to stderr)...");
+        let response = agent.run(&user_msg, &executor, 10).await?;
 
         println!("\n--- Chat Response ---\n{response}\n---");
     } else if let Some(msg) = send {
@@ -685,10 +598,11 @@ fn setup_graphql() -> Result<SleeperGraphql> {
 async fn process_trades(
     league_id: &str,
     sleeper: &mut SleeperClient,
-    analyzer: &dyn TradeAnalyzer,
+    agent: &AgentRunner,
     gql: Option<&SleeperGraphql>,
     review_state: &mut ReviewState,
     days: u64,
+    scoring: &str,
 ) -> Result<()> {
     let nfl_state = sleeper.get_nfl_state().await?;
     println!(
@@ -733,6 +647,12 @@ async fn process_trades(
 
     println!("Found {} new trade(s)!", trades.len());
 
+    // Load additional data needed for the tool executor
+    println!("Loading league history and player stats...");
+    let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
+    let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
+    let recent_transactions = transactions.clone();
+
     for trade in trades {
         let tx_id = trade.id().to_string();
         println!("\n--- Trade {tx_id} ---");
@@ -746,22 +666,28 @@ async fn process_trades(
                 }
             };
 
-        // Fetch recent news for players in the trade
-        println!("Fetching recent news for players...");
-        let news_by_id = news::fetch_player_news(&summary.player_ids, &players).await;
-
-        // Convert news map from player_id keys to display name keys
-        let mut player_news = std::collections::HashMap::new();
-        for (pid, news_text) in &news_by_id {
-            let name = sleeper::format_player_name(pid, &players);
-            player_news.insert(name, news_text.clone());
-        }
-
-        let prompt = trade_analyzer::build_prompt(&summary, &player_news);
+        // Build a simple trade prompt (no pre-fetched news — agent will search itself)
+        let prompt = trade_analyzer::build_prompt(&summary, &HashMap::new());
         println!("\nTrade details:\n{prompt}\n");
 
-        println!("Generating analysis...");
-        let analysis = match analyzer.analyze_trade(&prompt).await {
+        let executor = ToolExecutor {
+            sleeper,
+            league_id,
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring,
+            recent_transactions: &recent_transactions,
+        };
+
+        println!("Running agent for trade analysis...");
+        let analysis = match agent.run(&prompt, &executor, 10).await {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("Failed to analyze trade {tx_id}: {e}");

@@ -174,6 +174,27 @@ pub fn all_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Convert an Anthropic-format tool definition to a Gemini `functionDeclaration`.
+fn to_gemini_function_declaration(anthropic_tool: &Value) -> Value {
+    let mut decl = json!({
+        "name": anthropic_tool["name"],
+        "description": anthropic_tool["description"],
+    });
+    // Gemini uses "parameters" instead of "input_schema"
+    if let Some(schema) = anthropic_tool.get("input_schema") {
+        decl["parameters"] = schema.clone();
+    }
+    decl
+}
+
+/// Returns tool definitions in Gemini's format (array of `functionDeclarations`).
+pub fn all_gemini_tool_definitions() -> Vec<Value> {
+    all_tool_definitions()
+        .iter()
+        .map(to_gemini_function_declaration)
+        .collect()
+}
+
 /// Parse an LLM tool call (name + JSON input) into a ToolName variant.
 pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
     match name {

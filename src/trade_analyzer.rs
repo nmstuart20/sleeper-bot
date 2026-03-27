@@ -8,8 +8,6 @@ pub struct TradeSummary {
     pub team_b_name: String,
     pub team_b_record: String,
     pub team_b_receives: Vec<String>,
-    /// Player IDs involved in the trade (for news fetching)
-    pub player_ids: Vec<String>,
     /// Per-player context from Sleeper metadata (age, injury, depth chart, etc.)
     pub player_context: HashMap<String, String>,
 }
@@ -33,8 +31,6 @@ pub fn parse_trade(
         receives.entry(rid).or_default();
     }
 
-    // Track player IDs and collect context from Sleeper metadata
-    let mut player_ids = Vec::new();
     let mut player_context = HashMap::new();
 
     // Group player adds by receiving roster
@@ -47,7 +43,6 @@ pub fn parse_trade(
                 .push(name.clone());
 
             // Collect player metadata context
-            player_ids.push(player_id.clone());
             if let Some(player) = players.get(player_id) {
                 let ctx = player.context_summary();
                 if !ctx.is_empty() {
@@ -103,7 +98,6 @@ pub fn parse_trade(
         team_b_name: get_name(team_b_id),
         team_b_record: get_record(team_b_id),
         team_b_receives: receives.remove(&team_b_id).unwrap_or_default(),
-        player_ids,
         player_context,
     })
 }
@@ -276,7 +270,6 @@ mod tests {
                 "Player B (RB - DAL)".to_string(),
                 "2025 Round 1 Pick".to_string(),
             ],
-            player_ids: vec![],
             player_context: HashMap::new(),
         };
 

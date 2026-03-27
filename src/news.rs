@@ -1,52 +1,20 @@
 use anyhow::Result;
-use std::collections::HashMap;
-
-use crate::sleeper::Player;
 
 const GOOGLE_NEWS_RSS: &str = "https://news.google.com/rss/search";
 
-/// Fetch recent news headlines for a list of player IDs via Google News RSS.
-/// Returns a map of player_id → news headlines string.
-pub async fn fetch_player_news(
-    player_ids: &[String],
-    players: &HashMap<String, Player>,
-) -> HashMap<String, String> {
+/// Search Google News RSS for a query and return formatted headlines.
+/// Used as a client-side web search tool for the Gemini agent.
+pub async fn web_search(query: &str) -> String {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_default();
 
-    let mut results = HashMap::new();
-
-    for player_id in player_ids {
-        let player = match players.get(player_id) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let name = player.full_name();
-        if name.is_empty() {
-            continue;
-        }
-
-        let team = player.team.as_deref().unwrap_or("");
-        let query = format!("{name} {team} NFL");
-
-        match fetch_google_news(&client, &query).await {
-            Ok(headlines) if !headlines.is_empty() => {
-                results.insert(player_id.clone(), headlines);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Warning: news fetch failed for {name}: {e}");
-            }
-        }
-
-        // Small delay to be respectful to Google
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    match fetch_google_news(&client, query).await {
+        Ok(headlines) if !headlines.is_empty() => headlines,
+        Ok(_) => "No relevant news found.".to_string(),
+        Err(e) => format!("Search failed: {e}"),
     }
-
-    results
 }
 
 /// Fetch recent news headlines from Google News RSS for a query.

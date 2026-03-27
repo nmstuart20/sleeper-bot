@@ -26,7 +26,7 @@ SLEEPER_TOKEN=eyJhbGciOiJIUzI1NiIs...
 
 1. Log into [sleeper.app](https://sleeper.app) in your browser
 2. DevTools (F12) → **Application** → **Local Storage** → `https://sleeper.app`
-3. Copy the `eyJ...` auth token into `.env` as `SLEEPER_TOKEN`
+3. Copy the auth token into `.env` as `SLEEPER_TOKEN`
 
 ## Commands
 

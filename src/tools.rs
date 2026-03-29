@@ -1171,9 +1171,7 @@ impl<'a> ToolExecutor<'a> {
             }
 
             // The oldest message in this batch becomes the cursor for the next page
-            let oldest_id = messages
-                .last()
-                .and_then(|m| m.message_id.clone());
+            let oldest_id = messages.last().and_then(|m| m.message_id.clone());
 
             for msg in &messages {
                 total_fetched += 1;
@@ -1181,18 +1179,16 @@ impl<'a> ToolExecutor<'a> {
                 let created = msg.created.unwrap_or(0);
 
                 // Date filters — Sleeper timestamps appear to be in milliseconds
-                if let Some(after) = after_ts {
-                    if created < after {
+                if let Some(after) = after_ts
+                    && created < after {
                         // Messages are newest-first; if we've gone past after_date, skip
                         // but keep paginating in case ordering isn't guaranteed
                         continue;
                     }
-                }
-                if let Some(before) = before_ts {
-                    if created > before {
+                if let Some(before) = before_ts
+                    && created > before {
                         continue;
                     }
-                }
 
                 // Username filter
                 if let Some(ref u) = username_lower {
@@ -1215,10 +1211,7 @@ impl<'a> ToolExecutor<'a> {
                 }
 
                 // Format the matching message
-                let author = msg
-                    .author_display_name
-                    .as_deref()
-                    .unwrap_or("Unknown");
+                let author = msg.author_display_name.as_deref().unwrap_or("Unknown");
                 let text = msg.text.as_deref().unwrap_or("");
                 let date_str = if created > 0 {
                     // Try both milliseconds and seconds

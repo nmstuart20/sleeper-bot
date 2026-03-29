@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+use crate::graphql::SleeperGraphql;
 use crate::sleeper;
 use crate::sleeper::{
     AllTimeUserStats, NflState, Player, PlayerSeasonEntry, PlayerStats, Roster, SeasonChampion,
@@ -36,6 +37,13 @@ pub enum ToolName {
     /// Returns detailed results for a past season: final standings, playoff bracket,
     /// and champion. Walks the previous_league_id chain to find the target season.
     GetPastSeasonResults { seasons_ago: u32 },
+    /// Searches league chat message history with optional filters for username, keyword, and date range.
+    SearchLeagueMessages {
+        username: Option<String>,
+        keyword: Option<String>,
+        after_date: Option<String>,
+        before_date: Option<String>,
+    },
 }
 
 /// Returns the Anthropic API tool JSON schema for each tool.
@@ -156,6 +164,32 @@ fn tool_definition(tool: &str) -> Value {
                 "required": ["seasons_ago"]
             }
         }),
+        "search_league_messages" => json!({
+            "name": "search_league_messages",
+            "description": "Search through the league's chat message history. Use this when someone asks about what a league member said in the past, such as bets, predictions, claims, trash talk, or any prior statements. You can filter by username, keyword/phrase, and/or date range. Returns up to 1000 messages worth of history.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "Optional: filter messages by author display name (case-insensitive, partial match)"
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Optional: filter messages containing this keyword or phrase (case-insensitive)"
+                    },
+                    "after_date": {
+                        "type": "string",
+                        "description": "Optional: only include messages sent after this date (format: YYYY-MM-DD)"
+                    },
+                    "before_date": {
+                        "type": "string",
+                        "description": "Optional: only include messages sent before this date (format: YYYY-MM-DD)"
+                    }
+                },
+                "required": []
+            }
+        }),
         _ => json!({}),
     }
 }
@@ -171,6 +205,7 @@ pub fn all_tool_definitions() -> Vec<Value> {
         tool_definition("get_matchup"),
         tool_definition("get_league_history"),
         tool_definition("get_past_season_results"),
+        tool_definition("search_league_messages"),
     ]
 }
 
@@ -266,6 +301,31 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
             Ok(ToolName::GetPastSeasonResults { seasons_ago })
         }
 
+        "search_league_messages" => {
+            let username = input
+                .get("username")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let keyword = input
+                .get("keyword")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let after_date = input
+                .get("after_date")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let before_date = input
+                .get("before_date")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Ok(ToolName::SearchLeagueMessages {
+                username,
+                keyword,
+                after_date,
+                before_date,
+            })
+        }
+
         _ => Err(anyhow!("Unknown tool: {}", name)),
     }
 }
@@ -285,6 +345,7 @@ pub struct ToolExecutor<'a> {
     pub all_time_stats: &'a [AllTimeUserStats],
     pub scoring: &'a str,
     pub recent_transactions: &'a [Transaction],
+    pub gql: Option<&'a SleeperGraphql>,
 }
 
 impl<'a> ToolExecutor<'a> {
@@ -304,6 +365,20 @@ impl<'a> ToolExecutor<'a> {
             ToolName::GetLeagueHistory => self.get_league_history(),
             ToolName::GetPastSeasonResults { seasons_ago } => {
                 self.get_past_season_results(*seasons_ago).await
+            }
+            ToolName::SearchLeagueMessages {
+                username,
+                keyword,
+                after_date,
+                before_date,
+            } => {
+                self.search_league_messages(
+                    username.as_deref(),
+                    keyword.as_deref(),
+                    after_date.as_deref(),
+                    before_date.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -1046,6 +1121,163 @@ impl<'a> ToolExecutor<'a> {
 
         Ok(result)
     }
+
+    /// Search league chat messages with optional filters. Paginates through up to 1000 messages.
+    async fn search_league_messages(
+        &self,
+        username: Option<&str>,
+        keyword: Option<&str>,
+        after_date: Option<&str>,
+        before_date: Option<&str>,
+    ) -> Result<String> {
+        let gql = self
+            .gql
+            .ok_or_else(|| anyhow!("Message search is not available (no GraphQL client)"))?;
+
+        // Parse date filters into timestamps
+        let after_ts: Option<i64> = after_date.and_then(|d| {
+            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .ok()
+                .and_then(|nd| nd.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc().timestamp_millis())
+        });
+        let before_ts: Option<i64> = before_date.and_then(|d| {
+            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .ok()
+                .and_then(|nd| nd.and_hms_opt(23, 59, 59))
+                .map(|dt| dt.and_utc().timestamp_millis())
+        });
+
+        let username_lower = username.map(|u| u.to_lowercase());
+        let keyword_lower = keyword.map(|k| k.to_lowercase());
+
+        let mut all_matches: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut total_fetched: usize = 0;
+        const MAX_MESSAGES: usize = 1000;
+        const MAX_PAGES: usize = 40; // safety limit on API calls
+
+        for _ in 0..MAX_PAGES {
+            if total_fetched >= MAX_MESSAGES {
+                break;
+            }
+
+            let messages = gql
+                .fetch_messages(self.league_id, cursor.as_deref())
+                .await?;
+
+            if messages.is_empty() {
+                break;
+            }
+
+            // The oldest message in this batch becomes the cursor for the next page
+            let oldest_id = messages
+                .last()
+                .and_then(|m| m.message_id.clone());
+
+            for msg in &messages {
+                total_fetched += 1;
+
+                let created = msg.created.unwrap_or(0);
+
+                // Date filters — Sleeper timestamps appear to be in milliseconds
+                if let Some(after) = after_ts {
+                    if created < after {
+                        // Messages are newest-first; if we've gone past after_date, skip
+                        // but keep paginating in case ordering isn't guaranteed
+                        continue;
+                    }
+                }
+                if let Some(before) = before_ts {
+                    if created > before {
+                        continue;
+                    }
+                }
+
+                // Username filter
+                if let Some(ref u) = username_lower {
+                    let author = msg
+                        .author_display_name
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if !author.contains(u.as_str()) {
+                        continue;
+                    }
+                }
+
+                // Keyword filter
+                if let Some(ref k) = keyword_lower {
+                    let text = msg.text.as_deref().unwrap_or("").to_lowercase();
+                    if !text.contains(k.as_str()) {
+                        continue;
+                    }
+                }
+
+                // Format the matching message
+                let author = msg
+                    .author_display_name
+                    .as_deref()
+                    .unwrap_or("Unknown");
+                let text = msg.text.as_deref().unwrap_or("");
+                let date_str = if created > 0 {
+                    // Try both milliseconds and seconds
+                    let ts_secs = if created > 1_000_000_000_000 {
+                        created / 1000
+                    } else {
+                        created
+                    };
+                    chrono::DateTime::from_timestamp(ts_secs, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "unknown date".to_string())
+                } else {
+                    "unknown date".to_string()
+                };
+
+                all_matches.push(format!("[{date_str}] {author}: {text}"));
+            }
+
+            cursor = oldest_id;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        if all_matches.is_empty() {
+            let mut desc = String::from("No messages found");
+            let mut filters = Vec::new();
+            if let Some(u) = username {
+                filters.push(format!("from user \"{u}\""));
+            }
+            if let Some(k) = keyword {
+                filters.push(format!("containing \"{k}\""));
+            }
+            if let Some(d) = after_date {
+                filters.push(format!("after {d}"));
+            }
+            if let Some(d) = before_date {
+                filters.push(format!("before {d}"));
+            }
+            if !filters.is_empty() {
+                desc.push(' ');
+                desc.push_str(&filters.join(", "));
+            }
+            desc.push_str(&format!(" (searched {total_fetched} messages)."));
+            return Ok(desc);
+        }
+
+        let mut result = format!(
+            "Found {} matching message(s) (searched {total_fetched} messages):\n\n",
+            all_matches.len()
+        );
+        // Show oldest first for chronological reading
+        all_matches.reverse();
+        for m in &all_matches {
+            result.push_str(m);
+            result.push('\n');
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -1055,7 +1287,7 @@ mod tests {
     #[test]
     fn test_all_tool_definitions_count() {
         let tools = all_tool_definitions();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         for tool in &tools {
             assert!(tool.get("name").is_some(), "Tool missing 'name'");
             assert!(

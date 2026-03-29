@@ -437,6 +437,7 @@ async fn chat_poll_loop(
                         all_time_stats: &all_time_stats,
                         scoring,
                         recent_transactions: &recent_transactions,
+                        gql: Some(gql),
                     };
 
                     let lightweight_ctx = chat::build_lightweight_context(
@@ -549,6 +550,8 @@ async fn run_debug(
         let (historical_stats, projections) =
             sleeper.fetch_player_stats(&nfl_state.season, 3).await;
 
+        let gql_client = setup_graphql().ok();
+
         let agent = match provider {
             LlmProvider::Anthropic => {
                 let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -578,6 +581,7 @@ async fn run_debug(
             all_time_stats: &all_time_stats,
             scoring,
             recent_transactions: &recent_transactions,
+            gql: gql_client.as_ref(),
         };
 
         let lightweight_ctx =
@@ -707,6 +711,7 @@ async fn process_trades(
             all_time_stats: &all_time_stats,
             scoring,
             recent_transactions: &recent_transactions,
+            gql,
         };
 
         println!("Running agent for trade analysis...");

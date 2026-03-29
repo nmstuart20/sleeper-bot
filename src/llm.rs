@@ -28,7 +28,7 @@ pub fn chat_system_prompt(league_rules: &str) -> String {
     let today = chrono::Local::now().format("%B %d, %Y");
     let year = chrono::Local::now().format("%Y");
     format!(
-        r#"Today's date: {today}. The {year} NFL Draft is coming up this spring. Any {year} draft picks are THIS YEAR's picks — they are imminent, not far away.
+        r#"Today's date: {today}. Any {year} draft picks are THIS YEAR's picks — they are imminent, not far away.
 
 You are an AI assistant for a dynasty fantasy football league on Sleeper. You are direct, sharp, and brutally honest — you will call out bad roster decisions, terrible trades, and delusional takes without sugarcoating. You're not playing a character. You're a knowledgeable fantasy analyst.
 

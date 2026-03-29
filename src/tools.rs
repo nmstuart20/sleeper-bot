@@ -1180,15 +1180,17 @@ impl<'a> ToolExecutor<'a> {
 
                 // Date filters — Sleeper timestamps appear to be in milliseconds
                 if let Some(after) = after_ts
-                    && created < after {
-                        // Messages are newest-first; if we've gone past after_date, skip
-                        // but keep paginating in case ordering isn't guaranteed
-                        continue;
-                    }
+                    && created < after
+                {
+                    // Messages are newest-first; if we've gone past after_date, skip
+                    // but keep paginating in case ordering isn't guaranteed
+                    continue;
+                }
                 if let Some(before) = before_ts
-                    && created > before {
-                        continue;
-                    }
+                    && created > before
+                {
+                    continue;
+                }
 
                 // Username filter
                 if let Some(ref u) = username_lower {

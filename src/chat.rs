@@ -93,22 +93,22 @@ mod tests {
 
     #[test]
     fn test_is_mention() {
-        let bot = "tradegimp210";
-        assert!(is_mention("hey @tradegimp210 who should I start?", bot));
-        assert!(is_mention("@tradegimp210", bot));
-        assert!(is_mention("yo tradegimp210 what do you think?", bot));
+        let bot = "tradebot123";
+        assert!(is_mention("hey @tradebot123 who should I start?", bot));
+        assert!(is_mention("@tradebot123", bot));
+        assert!(is_mention("yo tradebot123 what do you think?", bot));
         assert!(!is_mention("hey guys what's up", bot));
     }
 
     #[test]
     fn test_strip_mention() {
-        let bot = "tradegimp210";
+        let bot = "tradebot123";
         assert_eq!(
-            strip_mention("@tradegimp210 who should I start at flex?", bot),
+            strip_mention("@tradebot123 who should I start at flex?", bot),
             "who should I start at flex?"
         );
         assert_eq!(
-            strip_mention("hey @tradegimp210 thoughts on this trade?", bot),
+            strip_mention("hey @tradebot123 thoughts on this trade?", bot),
             "hey  thoughts on this trade?"
         );
     }

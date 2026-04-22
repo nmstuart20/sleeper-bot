@@ -4,7 +4,7 @@ A Rust CLI that monitors a Sleeper fantasy football league for trades and chat @
 
 ## Setup
 
-Create a `.env` file in the project root:
+Environmental variables needed (can make a `.env` file in the project root for sensitive tokens and keys):
 
 ```
 SLEEPER_LEAGUE_ID=123456789
@@ -22,11 +22,24 @@ SLEEPER_TOKEN=...
 | `LLM_PROVIDER` | No | `anthropic` (default) or `gemini` |
 | `BOT_CHARACTER` | No | Character persona (default: `Donald Trump`) |
 
-### Getting your Sleeper token
+### Setting Up Sleeper for Chat
 
-1. Log into [sleeper.app](https://sleeper.app) in your browser
+Sleeper's API is read-only so to post in the chat we need a user account.
+
+If you don't want to post from your user account:
+
+1. Create a new account with username (example: tradebot123)
+2. Add account as a co-owner of a team in your league.
+
+#### Getting the Sleeper Token
+
+1. Log into [sleeper.app](https://sleeper.app) in your browser with the bot account
 2. DevTools (F12) → **Application** → **Local Storage** → `https://sleeper.app`
 3. Copy the auth token into `.env` as `SLEEPER_TOKEN`
+
+### Config
+
+Update the `config.toml` file with the league rules, scoring format and the bot_username
 
 ## Commands
 
@@ -89,7 +102,7 @@ cargo run --release -- debug --chat "Who won the league last year?" --league <ID
 
 1. Fetches NFL state and scans transactions across weeks 0–18
 2. Resolves player names, team records, draft picks, and player metadata (age, injury, depth chart)
-3. Fetches recent news headlines via Google News RSS
+3. Fetches recent news headlines via Google
 4. Sends structured prompt to the configured LLM with trade details, player context, and news
 5. In `watch` mode, also monitors league chat for @mentions and responds with league-aware answers
 6. Posts reviews/responses to Sleeper chat via GraphQL

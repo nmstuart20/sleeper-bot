@@ -21,7 +21,7 @@ fn default_scoring() -> String {
 }
 
 fn default_bot_username() -> String {
-    "tradegimp210".to_string()
+    "tradebot123".to_string()
 }
 
 impl Config {

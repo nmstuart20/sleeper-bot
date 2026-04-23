@@ -13,6 +13,7 @@ mod trade_analyzer;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::agent::ChatAgent;
 use crate::gemini_agent::GeminiChatAgent;
@@ -26,6 +27,8 @@ enum LlmProvider {
     Anthropic,
     Gemini,
 }
+
+const LEAGUE_DATA_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Parser)]
 #[command(name = "sleeper-trade-bot")]
@@ -190,6 +193,8 @@ async fn run_check(
 ) -> Result<()> {
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
+    println!("Loading league data for trade check...");
+    let league_data = load_league_data(&mut sleeper, league_id).await?;
 
     let gql = if post {
         match setup_graphql() {
@@ -206,6 +211,7 @@ async fn run_check(
     process_trades(
         league_id,
         &mut sleeper,
+        &league_data,
         agent,
         gql.as_ref(),
         &mut review_state,
@@ -219,6 +225,55 @@ struct WatchConfig {
     trade_interval: u64,
     chat_interval: u64,
     days: u64,
+}
+
+struct LeagueData {
+    league: sleeper::League,
+    users: Vec<sleeper::User>,
+    rosters: Vec<sleeper::Roster>,
+    roster_names: HashMap<u32, String>,
+    roster_records: HashMap<u32, String>,
+    players: HashMap<String, Player>,
+    nfl_state: sleeper::NflState,
+    historical_stats: HashMap<String, Vec<sleeper::PlayerSeasonEntry>>,
+    projections: HashMap<String, sleeper::PlayerStats>,
+    champions: Vec<sleeper::SeasonChampion>,
+    all_time_stats: Vec<sleeper::AllTimeUserStats>,
+    recent_transactions: Vec<sleeper::Transaction>,
+}
+
+async fn load_league_data(sleeper: &mut SleeperClient, league_id: &str) -> Result<LeagueData> {
+    let league = sleeper.get_league(league_id).await?;
+    let users = sleeper.get_users(league_id).await?;
+    let rosters = sleeper.get_rosters(league_id).await?;
+    let roster_names = sleeper::build_roster_name_map(&users, &rosters);
+    let roster_records = sleeper::build_roster_record_map(&rosters);
+    let players = sleeper.load_players().await?.clone();
+
+    let nfl_state = sleeper.get_nfl_state().await?;
+    let max_week = std::cmp::max(nfl_state.week, 1);
+    let recent_transactions = sleeper
+        .get_all_transactions(league_id, max_week)
+        .await
+        .unwrap_or_default();
+
+    let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
+    let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
+
+    Ok(LeagueData {
+        league,
+        users,
+        rosters,
+        roster_names,
+        roster_records,
+        players,
+        nfl_state,
+        historical_stats,
+        projections,
+        champions,
+        all_time_stats,
+        recent_transactions,
+    })
 }
 
 async fn run_watch(
@@ -286,11 +341,21 @@ async fn trade_poll_loop(
 ) -> Result<()> {
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
+    println!("Loading league data for trade watch...");
+    let mut league_data = load_league_data(&mut sleeper, league_id).await?;
+    let mut last_refresh = Instant::now();
 
     loop {
+        if last_refresh.elapsed() >= LEAGUE_DATA_REFRESH_INTERVAL {
+            println!("Refreshing league data for trade watch...");
+            league_data = load_league_data(&mut sleeper, league_id).await?;
+            last_refresh = Instant::now();
+        }
+
         if let Err(e) = process_trades(
             league_id,
             &mut sleeper,
+            &league_data,
             agent,
             Some(gql),
             &mut review_state,
@@ -349,25 +414,16 @@ async fn chat_poll_loop(
     let mut chat_state = ChatState::load()?;
     let mut sleeper = SleeperClient::new();
 
-    // Pre-load league data
     println!("Loading league data for chat...");
-    let _league = sleeper.get_league(league_id).await?;
-    let users = sleeper.get_users(league_id).await?;
-    let rosters = sleeper.get_rosters(league_id).await?;
-    let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
-    let roster_names = sleeper::build_roster_name_map(&users, &rosters);
-
-    let nfl_state = sleeper.get_nfl_state().await?;
-    let max_week = std::cmp::max(nfl_state.week, 1);
-    let recent_transactions = sleeper
-        .get_all_transactions(league_id, max_week)
-        .await
-        .unwrap_or_default();
-    println!("Loading league history...");
-    let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
-
-    println!("Loading player stats and projections...");
-    let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
+    let mut league_data = load_league_data(&mut sleeper, league_id).await?;
+    let mut lightweight_ctx = chat::build_lightweight_context(
+        &league_data.league,
+        &league_data.users,
+        &league_data.rosters,
+        &league_data.nfl_state,
+        scoring,
+    );
+    let mut last_refresh = Instant::now();
 
     // Set up agent for the chosen provider
     let agent = match provider {
@@ -386,6 +442,19 @@ async fn chat_poll_loop(
     };
 
     loop {
+        if last_refresh.elapsed() >= LEAGUE_DATA_REFRESH_INTERVAL {
+            println!("Refreshing league data for chat...");
+            league_data = load_league_data(&mut sleeper, league_id).await?;
+            lightweight_ctx = chat::build_lightweight_context(
+                &league_data.league,
+                &league_data.users,
+                &league_data.rosters,
+                &league_data.nfl_state,
+                scoring,
+            );
+            last_refresh = Instant::now();
+        }
+
         match gql.fetch_messages(league_id, None).await {
             Ok(messages) => {
                 for msg in &messages {
@@ -426,23 +495,19 @@ async fn chat_poll_loop(
                     let executor = ToolExecutor {
                         sleeper: &sleeper,
                         league_id,
-                        players: &players,
-                        users: &users,
-                        rosters: &rosters,
-                        roster_names: &roster_names,
-                        nfl_state: &nfl_state,
-                        historical_stats: &historical_stats,
-                        projections: &projections,
-                        champions: &champions,
-                        all_time_stats: &all_time_stats,
+                        players: &league_data.players,
+                        users: &league_data.users,
+                        rosters: &league_data.rosters,
+                        roster_names: &league_data.roster_names,
+                        nfl_state: &league_data.nfl_state,
+                        historical_stats: &league_data.historical_stats,
+                        projections: &league_data.projections,
+                        champions: &league_data.champions,
+                        all_time_stats: &league_data.all_time_stats,
                         scoring,
-                        recent_transactions: &recent_transactions,
+                        recent_transactions: &league_data.recent_transactions,
                         gql: Some(gql),
                     };
-
-                    let lightweight_ctx = chat::build_lightweight_context(
-                        &_league, &users, &rosters, &nfl_state, scoring,
-                    );
 
                     // Prepend recent conversation history for follow-up context
                     let author_id = msg.author_id.as_deref().unwrap_or("");
@@ -530,25 +595,7 @@ async fn run_debug(
 
         println!("Loading league data...");
         let mut sleeper = SleeperClient::new();
-        let _league_data = sleeper.get_league(&league_id).await?;
-        let users: Vec<sleeper::User> = sleeper.get_users(&league_id).await?;
-        let rosters = sleeper.get_rosters(&league_id).await?;
-        let players: HashMap<String, sleeper::Player> = sleeper.load_players().await?.clone();
-        let roster_names = sleeper::build_roster_name_map(&users, &rosters);
-
-        let nfl_state = sleeper.get_nfl_state().await?;
-        let max_week = std::cmp::max(nfl_state.week, 1);
-        let recent_transactions = sleeper
-            .get_all_transactions(&league_id, max_week)
-            .await
-            .unwrap_or_default();
-
-        println!("Loading league history...");
-        let (champions, all_time_stats) = sleeper.fetch_league_history(&league_id).await;
-
-        println!("Loading player stats and projections...");
-        let (historical_stats, projections) =
-            sleeper.fetch_player_stats(&nfl_state.season, 3).await;
+        let league_data = load_league_data(&mut sleeper, &league_id).await?;
 
         let gql_client = setup_graphql().ok();
 
@@ -570,22 +617,27 @@ async fn run_debug(
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: &league_id,
-            players: &players,
-            users: &users,
-            rosters: &rosters,
-            roster_names: &roster_names,
-            nfl_state: &nfl_state,
-            historical_stats: &historical_stats,
-            projections: &projections,
-            champions: &champions,
-            all_time_stats: &all_time_stats,
+            players: &league_data.players,
+            users: &league_data.users,
+            rosters: &league_data.rosters,
+            roster_names: &league_data.roster_names,
+            nfl_state: &league_data.nfl_state,
+            historical_stats: &league_data.historical_stats,
+            projections: &league_data.projections,
+            champions: &league_data.champions,
+            all_time_stats: &league_data.all_time_stats,
             scoring,
-            recent_transactions: &recent_transactions,
+            recent_transactions: &league_data.recent_transactions,
             gql: gql_client.as_ref(),
         };
 
-        let lightweight_ctx =
-            chat::build_lightweight_context(&_league_data, &users, &rosters, &nfl_state, scoring);
+        let lightweight_ctx = chat::build_lightweight_context(
+            &league_data.league,
+            &league_data.users,
+            &league_data.rosters,
+            &league_data.nfl_state,
+            scoring,
+        );
         let user_msg = format!(
             "League context: {lightweight_ctx}\n\n\
              debug_user tagged you in the league chat and said:\n\"{question}\""
@@ -625,24 +677,18 @@ fn setup_graphql() -> Result<SleeperGraphql> {
 async fn process_trades(
     league_id: &str,
     sleeper: &mut SleeperClient,
+    league_data: &LeagueData,
     agent: &AgentRunner,
     gql: Option<&SleeperGraphql>,
     review_state: &mut ReviewState,
     days: u64,
     scoring: &str,
 ) -> Result<()> {
-    let nfl_state = sleeper.get_nfl_state().await?;
+    let nfl_state = &league_data.nfl_state;
     println!(
         "NFL {} {} - Week {}",
         nfl_state.season, nfl_state.season_type, nfl_state.week
     );
-
-    let users = sleeper.get_users(league_id).await?;
-    let rosters = sleeper.get_rosters(league_id).await?;
-    let roster_names = sleeper::build_roster_name_map(&users, &rosters);
-    let roster_records = sleeper::build_roster_record_map(&rosters);
-
-    let players: HashMap<String, Player> = sleeper.load_players().await?.clone();
 
     // Scan all weeks (0 through 18) to catch offseason/dynasty trades.
     let max_week = std::cmp::max(nfl_state.week, 18);
@@ -674,24 +720,24 @@ async fn process_trades(
 
     println!("Found {} new trade(s)!", trades.len());
 
-    // Load additional data needed for the tool executor
-    println!("Loading league history and player stats...");
-    let (champions, all_time_stats) = sleeper.fetch_league_history(league_id).await;
-    let (historical_stats, projections) = sleeper.fetch_player_stats(&nfl_state.season, 3).await;
     let recent_transactions = transactions.clone();
 
     for trade in trades {
         let tx_id = trade.id().to_string();
         println!("\n--- Trade {tx_id} ---");
 
-        let summary =
-            match trade_analyzer::parse_trade(trade, &roster_names, &roster_records, &players) {
-                Some(s) => s,
-                None => {
-                    eprintln!("Could not parse trade {tx_id}, skipping.");
-                    continue;
-                }
-            };
+        let summary = match trade_analyzer::parse_trade(
+            trade,
+            &league_data.roster_names,
+            &league_data.roster_records,
+            &league_data.players,
+        ) {
+            Some(s) => s,
+            None => {
+                eprintln!("Could not parse trade {tx_id}, skipping.");
+                continue;
+            }
+        };
 
         // Build a simple trade prompt (no pre-fetched news — agent will search itself)
         let prompt = trade_analyzer::build_prompt(&summary, &HashMap::new());
@@ -700,15 +746,15 @@ async fn process_trades(
         let executor = ToolExecutor {
             sleeper,
             league_id,
-            players: &players,
-            users: &users,
-            rosters: &rosters,
-            roster_names: &roster_names,
-            nfl_state: &nfl_state,
-            historical_stats: &historical_stats,
-            projections: &projections,
-            champions: &champions,
-            all_time_stats: &all_time_stats,
+            players: &league_data.players,
+            users: &league_data.users,
+            rosters: &league_data.rosters,
+            roster_names: &league_data.roster_names,
+            nfl_state,
+            historical_stats: &league_data.historical_stats,
+            projections: &league_data.projections,
+            champions: &league_data.champions,
+            all_time_stats: &league_data.all_time_stats,
             scoring,
             recent_transactions: &recent_transactions,
             gql,

@@ -9,6 +9,25 @@ use crate::sleeper::{
     SleeperClient, Transaction, User,
 };
 
+fn normalize_name(name: &str) -> String {
+    let normalized: String = name
+        .chars()
+        .filter(|c| !matches!(c, '.' | '-' | '\'' | '’'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_active_nfl_player(player: &Player) -> bool {
+    matches!(player.team.as_deref(), Some(team) if !team.trim().is_empty())
+}
+
+fn format_player_match(player: &Player) -> String {
+    let pos = player.position.as_deref().unwrap_or("??");
+    let team = player.team.as_deref().unwrap_or("FA");
+    format!("{} ({}, {})", player.full_name(), pos, team)
+}
+
 /// Represents each tool the LLM can call during an agentic conversation.
 #[derive(Debug, Clone)]
 pub enum ToolName {
@@ -460,7 +479,7 @@ impl<'a> ToolExecutor<'a> {
     }
 
     fn get_team_roster(&self, team_name: &str) -> Result<String> {
-        let lower_query = team_name.to_lowercase();
+        let normalized_query = normalize_name(team_name);
         let user_map: HashMap<&str, &User> =
             self.users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 
@@ -479,9 +498,15 @@ impl<'a> ToolExecutor<'a> {
                 .metadata
                 .as_ref()
                 .and_then(|m| m.team_name.as_deref())
-                .unwrap_or("")
-                .to_lowercase();
-            display.contains(&lower_query) || team.contains(&lower_query)
+                .unwrap_or("");
+            let normalized_display = normalize_name(display.as_str());
+            let normalized_team = normalize_name(team);
+
+            (!normalized_query.is_empty() && normalized_display.contains(&normalized_query))
+                || (!normalized_query.is_empty() && normalized_team.contains(&normalized_query))
+                || (!normalized_display.is_empty()
+                    && normalized_query.contains(&normalized_display))
+                || (!normalized_team.is_empty() && normalized_query.contains(&normalized_team))
         });
 
         let roster = match matched_roster {
@@ -571,15 +596,17 @@ impl<'a> ToolExecutor<'a> {
     }
 
     fn get_player_info(&self, player_name: &str) -> Result<String> {
-        let lower_query = player_name.to_lowercase();
+        let normalized_query = normalize_name(player_name);
 
-        // Fuzzy match: find players whose full_name contains the query
-        let matched: Vec<(&String, &Player)> = self
+        // Fuzzy match: find players whose normalized full name contains the normalized query
+        let mut matched: Vec<(&String, &Player)> = self
             .players
             .iter()
             .filter(|(_, p)| {
-                let name = p.full_name().to_lowercase();
-                name.contains(&lower_query) || lower_query.contains(&name)
+                let normalized_name = normalize_name(&p.full_name());
+                !normalized_query.is_empty()
+                    && (normalized_name.contains(&normalized_query)
+                        || normalized_query.contains(&normalized_name))
             })
             .collect();
 
@@ -587,12 +614,50 @@ impl<'a> ToolExecutor<'a> {
             return Ok(format!("No player found matching \"{player_name}\"."));
         }
 
-        // Prefer exact match, then shortest name match
-        let (id, player) = matched
+        matched.sort_by(|a, b| {
+            let a_name = a.1.full_name();
+            let b_name = b.1.full_name();
+            a_name
+                .cmp(&b_name)
+                .then_with(|| a.1.position.cmp(&b.1.position))
+                .then_with(|| a.1.team.cmp(&b.1.team))
+                .then_with(|| a.0.cmp(b.0))
+        });
+
+        let exact_matches: Vec<(&String, &Player)> = matched
             .iter()
-            .find(|(_, p)| p.full_name().to_lowercase() == lower_query)
-            .or_else(|| matched.first())
-            .unwrap();
+            .copied()
+            .filter(|(_, p)| normalize_name(&p.full_name()) == normalized_query)
+            .collect();
+
+        let candidates = if exact_matches.is_empty() {
+            &matched
+        } else {
+            &exact_matches
+        };
+
+        let (id, player) = if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            let active_matches: Vec<(&String, &Player)> = candidates
+                .iter()
+                .copied()
+                .filter(|(_, p)| is_active_nfl_player(p))
+                .collect();
+
+            if active_matches.len() == 1 {
+                active_matches[0]
+            } else {
+                let match_list = candidates
+                    .iter()
+                    .map(|(_, p)| format_player_match(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(format!(
+                    "Multiple players match '{player_name}': {match_list}. Please specify which one."
+                ));
+            }
+        };
 
         let pos = player.position.as_deref().unwrap_or("??");
         let team = player.team.as_deref().unwrap_or("FA");
@@ -604,7 +669,7 @@ impl<'a> ToolExecutor<'a> {
         }
 
         // Historical stats
-        if let Some(seasons) = self.historical_stats.get(*id) {
+        if let Some(seasons) = self.historical_stats.get(id) {
             let mut sorted = seasons.clone();
             sorted.sort_by(|a, b| b.season.cmp(&a.season));
             for entry in &sorted {
@@ -616,7 +681,7 @@ impl<'a> ToolExecutor<'a> {
         }
 
         // Current projections
-        if let Some(proj) = self.projections.get(*id) {
+        if let Some(proj) = self.projections.get(id) {
             let s = proj.summary(self.scoring);
             if !s.is_empty() {
                 result.push_str(&format!("Projected: {}\n", s));
@@ -627,7 +692,7 @@ impl<'a> ToolExecutor<'a> {
         let rostered_by = self.rosters.iter().find(|r| {
             r.players
                 .as_ref()
-                .map(|ps| ps.iter().any(|pid| pid == *id))
+                .map(|ps| ps.iter().any(|pid| pid == id))
                 .unwrap_or(false)
         });
         if let Some(roster) = rostered_by {
@@ -1278,6 +1343,17 @@ impl<'a> ToolExecutor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sleeper::{RosterSettings, UserMetadata};
+
+    fn test_player(first: &str, last: &str, position: &str, team: Option<&str>) -> Player {
+        Player {
+            first_name: Some(first.to_string()),
+            last_name: Some(last.to_string()),
+            position: Some(position.to_string()),
+            team: team.map(|t| t.to_string()),
+            ..Player::default()
+        }
+    }
 
     #[test]
     fn test_all_tool_definitions_count() {
@@ -1410,5 +1486,178 @@ mod tests {
     fn test_parse_missing_required_fields() {
         assert!(parse_tool_call("get_player_info", &json!({})).is_err());
         assert!(parse_tool_call("get_matchup", &json!({})).is_err());
+    }
+
+    #[test]
+    fn test_normalize_name() {
+        assert_eq!(normalize_name("A.J. Brown"), "aj brown");
+        assert_eq!(normalize_name("D'Andre Swift"), "dandre swift");
+        assert_eq!(normalize_name("Amon-Ra   St. Brown"), "amonra st brown");
+    }
+
+    #[test]
+    fn test_get_player_info_prefers_normalized_exact_match() {
+        let sleeper = SleeperClient::new();
+        let players = HashMap::from([
+            (
+                "1".to_string(),
+                test_player("A.J.", "Brown", "WR", Some("PHI")),
+            ),
+            (
+                "2".to_string(),
+                test_player("Marquise", "Brown", "WR", Some("KC")),
+            ),
+        ]);
+        let users = Vec::new();
+        let rosters = Vec::new();
+        let roster_names = HashMap::new();
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        let projections = HashMap::new();
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor.get_player_info("AJ Brown").unwrap();
+        assert!(result.starts_with("A.J. Brown (WR, PHI)\n"));
+    }
+
+    #[test]
+    fn test_get_player_info_disambiguates_multiple_matches() {
+        let sleeper = SleeperClient::new();
+        let players = HashMap::from([
+            (
+                "1".to_string(),
+                test_player("Mike", "Williams", "WR", Some("NYJ")),
+            ),
+            (
+                "2".to_string(),
+                test_player("Jameson", "Williams", "WR", Some("DET")),
+            ),
+            (
+                "3".to_string(),
+                test_player("Caleb", "Williams", "QB", Some("CHI")),
+            ),
+        ]);
+        let users = Vec::new();
+        let rosters = Vec::new();
+        let roster_names = HashMap::new();
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        let projections = HashMap::new();
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor.get_player_info("Williams").unwrap();
+        assert_eq!(
+            result,
+            "Multiple players match 'Williams': Caleb Williams (QB, CHI), Jameson Williams (WR, DET), Mike Williams (WR, NYJ). Please specify which one."
+        );
+    }
+
+    #[test]
+    fn test_get_team_roster_uses_normalized_matching() {
+        let sleeper = SleeperClient::new();
+        let players = HashMap::from([(
+            "1".to_string(),
+            test_player("D'Andre", "Swift", "RB", Some("CHI")),
+        )]);
+        let users = vec![User {
+            user_id: "user-1".to_string(),
+            display_name: Some("Nick".to_string()),
+            metadata: Some(UserMetadata {
+                team_name: Some("D'Andre Dogs".to_string()),
+            }),
+        }];
+        let rosters = vec![Roster {
+            roster_id: 1,
+            owner_id: Some("user-1".to_string()),
+            players: Some(vec!["1".to_string()]),
+            starters: Some(vec!["1".to_string()]),
+            settings: Some(RosterSettings {
+                wins: Some(3),
+                losses: Some(1),
+                ties: Some(0),
+                fpts: None,
+                fpts_decimal: None,
+                fpts_against: None,
+                fpts_against_decimal: None,
+            }),
+        }];
+        let roster_names = HashMap::from([(1, "Nick (D'Andre Dogs)".to_string())]);
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        let projections = HashMap::new();
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor.get_team_roster("dandre dogs").unwrap();
+        assert!(result.contains("Nick (D'Andre Dogs) (3-1)"));
+        assert!(result.contains("D'Andre Swift (RB, CHI)"));
     }
 }

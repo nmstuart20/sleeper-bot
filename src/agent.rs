@@ -5,7 +5,8 @@ use serde_json::Value;
 use crate::tools::{self, ToolExecutor};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const MODEL: &str = "claude-sonnet-4-20250514";
+const TOOL_MODEL: &str = "claude-haiku-4-5-20251001";
+const FINAL_MODEL: &str = "claude-sonnet-4-20250514";
 
 // ─── Request types ───
 
@@ -128,30 +129,47 @@ impl ChatAgent {
             content: AgentContent::Text(user_message.to_string()),
         }];
 
-        let mut total_input_tokens: u64 = 0;
-        let mut total_output_tokens: u64 = 0;
+        let mut haiku_input_tokens: u64 = 0;
+        let mut haiku_output_tokens: u64 = 0;
+        let mut sonnet_input_tokens: u64 = 0;
+        let mut sonnet_output_tokens: u64 = 0;
+        let mut tool_iterations: u32 = 0;
+        let mut final_iterations: u32 = 0;
         let mut total_tool_calls: u32 = 0;
 
         for iteration in 0..max_iterations {
-            let response = self.call_api(&messages).await?;
+            eprintln!("  [iter {iteration}] model={TOOL_MODEL}");
+            let response = self.call_api(TOOL_MODEL, &messages).await?;
+            tool_iterations += 1;
 
             // Accumulate token usage
             if let Some(ref usage) = response.usage {
-                total_input_tokens += usage.input_tokens;
-                total_output_tokens += usage.output_tokens;
+                haiku_input_tokens += usage.input_tokens;
+                haiku_output_tokens += usage.output_tokens;
             }
 
             let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
 
             match stop_reason {
                 "end_turn" => {
-                    let text = extract_text(&response.content);
+                    let text = if total_tool_calls > 0 {
+                        eprintln!(
+                            "  [iter {iteration}] End turn reached — refining final response with {FINAL_MODEL}"
+                        );
+                        let final_response = self.call_api(FINAL_MODEL, &messages).await?;
+                        final_iterations += 1;
+                        if let Some(ref usage) = final_response.usage {
+                            sonnet_input_tokens += usage.input_tokens;
+                            sonnet_output_tokens += usage.output_tokens;
+                        }
+                        extract_text(&final_response.content)
+                    } else {
+                        extract_text(&response.content)
+                    };
+                    let total_input = haiku_input_tokens + sonnet_input_tokens;
+                    let total_output = haiku_output_tokens + sonnet_output_tokens;
                     eprintln!(
-                        "Agent completed in {} iteration(s), {} tool call(s), {} input tokens, {} output tokens",
-                        iteration + 1,
-                        total_tool_calls,
-                        total_input_tokens,
-                        total_output_tokens
+                        "Agent completed: {tool_iterations} iterations (haiku), {final_iterations} final (sonnet), {total_input} input / {total_output} output tokens ({total_tool_calls} tool call(s))"
                     );
                     return Ok(text);
                 }
@@ -248,9 +266,13 @@ impl ChatAgent {
     }
 
     /// Make a single API call to Anthropic with retry logic.
-    async fn call_api(&self, messages: &[AgentMessage]) -> Result<AgentResponse> {
+    async fn call_api(
+        &self,
+        model: &'static str,
+        messages: &[AgentMessage],
+    ) -> Result<AgentResponse> {
         let body = AgentRequest {
-            model: MODEL,
+            model,
             max_tokens: 4096,
             system: self.system_prompt.clone(),
             messages: messages.to_vec(),

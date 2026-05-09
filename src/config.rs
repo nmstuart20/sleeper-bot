@@ -9,15 +9,19 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct LeagueConfig {
-    pub rules: String,
-    #[serde(default = "default_scoring")]
-    pub scoring: String,
+    /// Optional free-form notes about the league (payouts, custom rules,
+    /// etc.) appended to the API-derived format summary. The lineup and
+    /// scoring format are auto-detected from the Sleeper API, so this only
+    /// needs to capture things the API doesn't expose.
+    #[serde(default)]
+    pub rules: Option<String>,
+    /// Optional override for the scoring format used when looking up
+    /// projections. When unset, the bot derives this from the league's
+    /// `scoring_settings.rec` value (0 = std, 0.5 = half_ppr, 1 = ppr).
+    #[serde(default)]
+    pub scoring: Option<String>,
     #[serde(default = "default_bot_username")]
     pub bot_username: String,
-}
-
-fn default_scoring() -> String {
-    "half_ppr".to_string()
 }
 
 fn default_bot_username() -> String {

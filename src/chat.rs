@@ -19,15 +19,21 @@ pub fn strip_mention(text: &str, bot_username: &str) -> String {
 
 /// Build a short baseline context string (under 500 tokens) so the LLM can make
 /// intelligent first tool calls without needing the full league data dump.
+///
+/// The lineup and scoring format are pulled from the Sleeper API via
+/// `League::format_roster_positions` and `League::format_scoring_highlights`
+/// rather than the user-supplied config.
 pub fn build_lightweight_context(
     league: &League,
     users: &[User],
     rosters: &[Roster],
     nfl_state: &NflState,
-    scoring: &str,
 ) -> String {
     let league_name = league.name.as_deref().unwrap_or("Unknown League");
-    let num_teams = league.total_rosters.unwrap_or(0);
+    let num_teams = league
+        .total_rosters
+        .or_else(|| league.settings.as_ref().and_then(|s| s.num_teams))
+        .unwrap_or(0);
 
     let league_type = league
         .settings
@@ -40,11 +46,19 @@ pub fn build_lightweight_context(
         })
         .unwrap_or("Unknown");
 
-    let scoring_fmt = match scoring {
-        "ppr" => "Full PPR",
-        "std" => "Standard (non-PPR)",
-        _ => "Half PPR",
+    let superflex_label = if league.is_superflex() {
+        " superflex"
+    } else {
+        ""
     };
+    let lineup = league.format_roster_positions();
+    let scoring_fmt = league
+        .format_scoring_highlights()
+        .unwrap_or_else(|| match league.detect_scoring() {
+            "ppr" => "full PPR".to_string(),
+            "std" => "standard".to_string(),
+            _ => "half PPR".to_string(),
+        });
 
     let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 
@@ -78,7 +92,8 @@ pub fn build_lightweight_context(
         .collect();
 
     format!(
-        "League: {league_name} ({league_type}, {num_teams} teams, {scoring_fmt})\n\
+        "League: {league_name} ({league_type}, {num_teams}-team{superflex_label}, {scoring_fmt})\n\
+         Lineup: {lineup}\n\
          NFL {season} — Week {week}\n\
          Standings: {standings}",
         season = nfl_state.season,

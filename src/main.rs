@@ -99,7 +99,8 @@ async fn main() -> Result<()> {
 
     let config_path = std::path::Path::new("config.toml");
     let config = config::Config::load(config_path)?;
-    let league_rules = &config.league.rules;
+    let extra_rules = config.league.rules.as_deref();
+    let scoring_override = config.league.scoring.as_deref();
 
     match cli {
         Cli::Check {
@@ -110,11 +111,16 @@ async fn main() -> Result<()> {
             character,
         } => {
             println!("Character persona: {character}");
-            let trade_agent = build_agent_runner(
+            run_check(
+                &league,
+                post,
+                days,
                 &provider,
-                &llm::trade_system_prompt(&character, league_rules),
-            )?;
-            run_check(&league, post, days, &trade_agent, &config.league.scoring).await
+                &character,
+                extra_rules,
+                scoring_override,
+            )
+            .await
         }
         Cli::Watch {
             league,
@@ -133,8 +139,8 @@ async fn main() -> Result<()> {
             run_watch(
                 &league,
                 watch_config,
-                league_rules,
-                &config.league.scoring,
+                extra_rules,
+                scoring_override,
                 &config.league.bot_username,
                 &provider,
                 &character,
@@ -154,8 +160,8 @@ async fn main() -> Result<()> {
                 send,
                 chat,
                 league,
-                league_rules,
-                &config.league.scoring,
+                extra_rules,
+                scoring_override,
                 &provider,
             )
             .await
@@ -188,13 +194,24 @@ async fn run_check(
     league_id: &str,
     post: bool,
     days: u64,
-    agent: &AgentRunner,
-    scoring: &str,
+    provider: &LlmProvider,
+    character: &str,
+    extra_rules: Option<&str>,
+    scoring_override: Option<&str>,
 ) -> Result<()> {
     let mut sleeper = SleeperClient::new();
     let mut review_state = ReviewState::load()?;
     println!("Loading league data for trade check...");
     let league_data = load_league_data(&mut sleeper, league_id).await?;
+
+    let scoring = scoring_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| league_data.league.detect_scoring().to_string());
+    let league_format = league_data.league.format_summary(extra_rules);
+    println!("Detected league format: {league_format}");
+
+    let agent =
+        build_agent_runner(provider, &llm::trade_system_prompt(character, &league_format))?;
 
     let gql = if post {
         match setup_graphql() {
@@ -212,11 +229,11 @@ async fn run_check(
         league_id,
         &mut sleeper,
         &league_data,
-        agent,
+        &agent,
         gql.as_ref(),
         &mut review_state,
         days,
-        scoring,
+        &scoring,
     )
     .await
 }
@@ -279,8 +296,8 @@ async fn load_league_data(sleeper: &mut SleeperClient, league_id: &str) -> Resul
 async fn run_watch(
     league_id: &str,
     watch_config: WatchConfig,
-    league_rules: &str,
-    scoring: &str,
+    extra_rules: Option<&str>,
+    scoring_override: Option<&str>,
     bot_username: &str,
     provider: &LlmProvider,
     character: &str,
@@ -292,8 +309,19 @@ async fn run_watch(
         }
     };
 
+    // One upfront API call so we can derive scoring + roster format before
+    // building agents. The poll loops will reload the full league data on
+    // their own refresh interval.
+    let sleeper_probe = SleeperClient::new();
+    let initial_league = sleeper_probe.get_league(league_id).await?;
+    let scoring = scoring_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| initial_league.detect_scoring().to_string());
+    let league_format = initial_league.format_summary(extra_rules);
+    println!("Detected league format: {league_format}");
+
     let trade_agent =
-        build_agent_runner(provider, &llm::trade_system_prompt(character, league_rules))?;
+        build_agent_runner(provider, &llm::trade_system_prompt(character, &league_format))?;
 
     let trade_interval = watch_config.trade_interval;
     let chat_interval = watch_config.chat_interval;
@@ -303,12 +331,19 @@ async fn run_watch(
         "Watching league {league_id} — trades every {trade_interval}s, chat every {chat_interval}s. Press Ctrl+C to stop."
     );
 
-    let trade_loop = trade_poll_loop(league_id, trade_interval, days, &trade_agent, &gql, scoring);
+    let trade_loop = trade_poll_loop(
+        league_id,
+        trade_interval,
+        days,
+        &trade_agent,
+        &gql,
+        &scoring,
+    );
     let chat_loop = chat_poll_loop(
         league_id,
         chat_interval,
-        league_rules,
-        scoring,
+        &league_format,
+        &scoring,
         bot_username,
         provider,
         &gql,
@@ -395,7 +430,7 @@ impl AgentRunner {
 async fn chat_poll_loop(
     league_id: &str,
     interval: u64,
-    league_rules: &str,
+    league_format: &str,
     scoring: &str,
     bot_username: &str,
     provider: &LlmProvider,
@@ -421,7 +456,6 @@ async fn chat_poll_loop(
         &league_data.users,
         &league_data.rosters,
         &league_data.nfl_state,
-        scoring,
     );
     let mut last_refresh = Instant::now();
 
@@ -430,13 +464,13 @@ async fn chat_poll_loop(
         LlmProvider::Anthropic => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-            let sys = llm::chat_system_prompt(league_rules);
+            let sys = llm::chat_system_prompt(league_format);
             AgentRunner::Anthropic(ChatAgent::new(api_key, sys))
         }
         LlmProvider::Gemini => {
             let api_key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
-            let sys = llm::chat_system_prompt(league_rules);
+            let sys = llm::chat_system_prompt(league_format);
             AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys))
         }
     };
@@ -450,7 +484,6 @@ async fn chat_poll_loop(
                 &league_data.users,
                 &league_data.rosters,
                 &league_data.nfl_state,
-                scoring,
             );
             last_refresh = Instant::now();
         }
@@ -576,8 +609,8 @@ async fn run_debug(
     send: Option<String>,
     chat_question: Option<String>,
     league: Option<String>,
-    league_rules: &str,
-    scoring: &str,
+    extra_rules: Option<&str>,
+    scoring_override: Option<&str>,
     provider: &LlmProvider,
 ) -> Result<()> {
     if check_token {
@@ -597,19 +630,25 @@ async fn run_debug(
         let mut sleeper = SleeperClient::new();
         let league_data = load_league_data(&mut sleeper, &league_id).await?;
 
+        let scoring = scoring_override
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| league_data.league.detect_scoring().to_string());
+        let league_format = league_data.league.format_summary(extra_rules);
+        println!("Detected league format: {league_format}");
+
         let gql_client = setup_graphql().ok();
 
         let agent = match provider {
             LlmProvider::Anthropic => {
                 let api_key = std::env::var("ANTHROPIC_API_KEY")
                     .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
-                let sys = llm::chat_system_prompt(league_rules);
+                let sys = llm::chat_system_prompt(&league_format);
                 AgentRunner::Anthropic(ChatAgent::new(api_key, sys))
             }
             LlmProvider::Gemini => {
                 let api_key = std::env::var("GEMINI_API_KEY")
                     .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
-                let sys = llm::chat_system_prompt(league_rules);
+                let sys = llm::chat_system_prompt(&league_format);
                 AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys))
             }
         };
@@ -626,7 +665,7 @@ async fn run_debug(
             projections: &league_data.projections,
             champions: &league_data.champions,
             all_time_stats: &league_data.all_time_stats,
-            scoring,
+            scoring: &scoring,
             recent_transactions: &league_data.recent_transactions,
             gql: gql_client.as_ref(),
         };
@@ -636,7 +675,6 @@ async fn run_debug(
             &league_data.users,
             &league_data.rosters,
             &league_data.nfl_state,
-            scoring,
         );
         let user_msg = format!(
             "League context: {lightweight_ctx}\n\n\

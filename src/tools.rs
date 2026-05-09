@@ -67,6 +67,13 @@ pub enum ToolName {
         before_date: Option<String>,
         limit: Option<u32>,
     },
+    /// Compares fantasy start options on a team's roster at a given position
+    /// (or FLEX, which includes RB/WR/TE). Returns each eligible player with
+    /// projected points, injury status, and starter/bench slot info.
+    CompareStartOptions {
+        team_name: String,
+        position: String,
+    },
 }
 
 /// Returns the Anthropic API tool JSON schema for each tool.
@@ -192,6 +199,25 @@ fn tool_definition(tool: &str) -> Value {
                 "required": ["seasons_ago"]
             }
         }),
+        "compare_start_options" => json!({
+            "name": "compare_start_options",
+            "description": "Compare fantasy start options for a specific team at a given position. Returns each eligible player with their projected points, recent performance, injury status, and a recommendation. Use this when someone asks 'who should I start at flex/RB/WR?' etc.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "team_name": {
+                        "type": "string",
+                        "description": "The team or owner name to look up (fuzzy matched against display names and team names)"
+                    },
+                    "position": {
+                        "type": "string",
+                        "description": "Position to compare. Use FLEX to include RB/WR/TE eligible options.",
+                        "enum": ["QB", "RB", "WR", "TE", "K", "FLEX"]
+                    }
+                },
+                "required": ["team_name", "position"]
+            }
+        }),
         "search_league_messages" => json!({
             "name": "search_league_messages",
             "description": "Search through the league's chat message history. Use this when someone asks about what a league member said in the past, such as bets, predictions, claims, trash talk, or any prior statements. You can filter by username, keyword/phrase, and/or date range. Returns up to 1000 messages worth of history.",
@@ -239,6 +265,7 @@ pub fn all_tool_definitions() -> Vec<Value> {
         tool_definition("get_league_history"),
         tool_definition("get_past_season_results"),
         tool_definition("search_league_messages"),
+        tool_definition("compare_start_options"),
     ]
 }
 
@@ -339,6 +366,21 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
             Ok(ToolName::GetPastSeasonResults { seasons_ago })
         }
 
+        "compare_start_options" => {
+            let team_name = input
+                .get("team_name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("compare_start_options requires 'team_name' (string)"))?;
+            let position = input
+                .get("position")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("compare_start_options requires 'position' (string)"))?;
+            Ok(ToolName::CompareStartOptions {
+                team_name: team_name.to_string(),
+                position: position.to_string(),
+            })
+        }
+
         "search_league_messages" => {
             let username = input
                 .get("username")
@@ -424,6 +466,10 @@ impl<'a> ToolExecutor<'a> {
                 )
                 .await
             }
+            ToolName::CompareStartOptions {
+                team_name,
+                position,
+            } => self.compare_start_options(team_name, position),
         }
     }
 
@@ -639,6 +685,157 @@ impl<'a> ToolExecutor<'a> {
                 result.push_str(p);
                 result.push('\n');
             }
+        }
+
+        Ok(result)
+    }
+
+    fn compare_start_options(&self, team_name: &str, position: &str) -> Result<String> {
+        let normalized_query = normalize_name(team_name);
+        let user_map: HashMap<&str, &User> =
+            self.users.iter().map(|u| (u.user_id.as_str(), u)).collect();
+
+        // Find roster by fuzzy matching display_name or team_name (same as get_team_roster).
+        let matched_roster = self.rosters.iter().find(|r| {
+            let owner_id = match r.owner_id.as_deref() {
+                Some(id) => id,
+                None => return false,
+            };
+            let user = match user_map.get(owner_id) {
+                Some(u) => u,
+                None => return false,
+            };
+            let display = user.display_name.as_deref().unwrap_or("").to_lowercase();
+            let team = user
+                .metadata
+                .as_ref()
+                .and_then(|m| m.team_name.as_deref())
+                .unwrap_or("");
+            let normalized_display = normalize_name(display.as_str());
+            let normalized_team = normalize_name(team);
+
+            (!normalized_query.is_empty() && normalized_display.contains(&normalized_query))
+                || (!normalized_query.is_empty() && normalized_team.contains(&normalized_query))
+                || (!normalized_display.is_empty()
+                    && normalized_query.contains(&normalized_display))
+                || (!normalized_team.is_empty() && normalized_query.contains(&normalized_team))
+        });
+
+        let roster = match matched_roster {
+            Some(r) => r,
+            None => return Ok(format!("No team found matching \"{team_name}\".")),
+        };
+
+        let pos_upper = position.to_uppercase();
+        let allowed: &[&str] = match pos_upper.as_str() {
+            "QB" => &["QB"],
+            "RB" => &["RB"],
+            "WR" => &["WR"],
+            "TE" => &["TE"],
+            "K" => &["K"],
+            "FLEX" => &["RB", "WR", "TE"],
+            _ => {
+                return Ok(format!(
+                    "Unsupported position \"{position}\". Use QB, RB, WR, TE, K, or FLEX."
+                ));
+            }
+        };
+
+        let starter_ids: HashSet<&str> = roster
+            .starters
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| id.as_str() != "0")
+                    .map(|s| s.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let pts_key = |stats: &PlayerStats| -> f64 {
+            match self.scoring {
+                "ppr" => stats.pts_ppr.unwrap_or(0.0),
+                "std" => stats.pts_std.unwrap_or(0.0),
+                _ => stats.pts_half_ppr.unwrap_or(0.0),
+            }
+        };
+
+        // Collect (name, position, team, proj, is_starter, injury_str) for each eligible player.
+        let mut options: Vec<(String, String, String, f64, bool, String)> = roster
+            .players
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|pid| {
+                        let player = self.players.get(pid)?;
+                        let pos = player.position.as_deref().unwrap_or("??");
+                        if !allowed.iter().any(|a| pos.eq_ignore_ascii_case(a)) {
+                            return None;
+                        }
+                        let team = player.team.as_deref().unwrap_or("FA").to_string();
+                        let proj = self.projections.get(pid).map(pts_key).unwrap_or(0.0);
+                        let is_starter = starter_ids.contains(pid.as_str());
+                        let injury = match player.injury_status.as_deref() {
+                            None => "Healthy".to_string(),
+                            Some(status) => {
+                                let body = player.injury_body_part.as_deref().unwrap_or("");
+                                if body.is_empty() {
+                                    status.to_string()
+                                } else {
+                                    format!("{status} ({body})")
+                                }
+                            }
+                        };
+                        Some((
+                            player.full_name(),
+                            pos.to_string(),
+                            team,
+                            proj,
+                            is_starter,
+                            injury,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Sort by projected points descending.
+        options.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+        let owner_id = roster.owner_id.as_deref().unwrap_or("");
+        let user = user_map.get(owner_id);
+        let display_name = user
+            .and_then(|u| u.display_name.as_deref())
+            .unwrap_or("Unknown");
+        let team_label = user
+            .and_then(|u| u.metadata.as_ref())
+            .and_then(|m| m.team_name.as_deref())
+            .unwrap_or("");
+        let header = if !team_label.is_empty() {
+            format!("{display_name} ({team_label})")
+        } else {
+            display_name.to_string()
+        };
+
+        if options.is_empty() {
+            return Ok(format!(
+                "{header} has no rostered players eligible at {pos_upper}."
+            ));
+        }
+
+        let mut result = format!("{header} — start options at {pos_upper}:\n");
+        for (i, (name, pos, team, proj, is_starter, injury)) in options.iter().enumerate() {
+            let slot = if *is_starter { "Starter" } else { "Bench" };
+            result.push_str(&format!(
+                "{}. {} ({}, {}) — {:.1} proj pts, {}, {}\n",
+                i + 1,
+                name,
+                pos,
+                team,
+                proj,
+                slot,
+                injury
+            ));
         }
 
         Ok(result)
@@ -1422,7 +1619,7 @@ mod tests {
     #[test]
     fn test_all_tool_definitions_count() {
         let tools = all_tool_definitions();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         for tool in &tools {
             assert!(tool.get("name").is_some(), "Tool missing 'name'");
             assert!(
@@ -1512,6 +1709,157 @@ mod tests {
             }
             _ => panic!("Expected SearchWaiverWire"),
         }
+    }
+
+    #[test]
+    fn test_parse_compare_start_options() {
+        let input = json!({"team_name": "Touchdown Tyrants", "position": "FLEX"});
+        match parse_tool_call("compare_start_options", &input).unwrap() {
+            ToolName::CompareStartOptions {
+                team_name,
+                position,
+            } => {
+                assert_eq!(team_name, "Touchdown Tyrants");
+                assert_eq!(position, "FLEX");
+            }
+            _ => panic!("Expected CompareStartOptions"),
+        }
+    }
+
+    #[test]
+    fn test_parse_compare_start_options_missing_fields() {
+        assert!(parse_tool_call("compare_start_options", &json!({})).is_err());
+        assert!(
+            parse_tool_call(
+                "compare_start_options",
+                &json!({"team_name": "Touchdown Tyrants"})
+            )
+            .is_err()
+        );
+        assert!(parse_tool_call("compare_start_options", &json!({"position": "RB"})).is_err());
+    }
+
+    #[test]
+    fn test_compare_start_options_flex_sorted_by_projection() {
+        use crate::sleeper::PlayerStats;
+
+        let sleeper = SleeperClient::new();
+        let mut starter_rb = test_player("Starter", "RB", "RB", Some("DAL"));
+        starter_rb.injury_status = Some("Questionable".to_string());
+        starter_rb.injury_body_part = Some("knee".to_string());
+        let players = HashMap::from([
+            ("1".to_string(), starter_rb),
+            (
+                "2".to_string(),
+                test_player("Bench", "RB", "RB", Some("DAL")),
+            ),
+            (
+                "3".to_string(),
+                test_player("Bench", "WR", "WR", Some("DAL")),
+            ),
+            // QB should be filtered out for FLEX.
+            (
+                "4".to_string(),
+                test_player("Backup", "QB", "QB", Some("DAL")),
+            ),
+        ]);
+        let users = vec![User {
+            user_id: "user-1".to_string(),
+            display_name: Some("Nick".to_string()),
+            metadata: Some(UserMetadata {
+                team_name: Some("Touchdown Tyrants".to_string()),
+            }),
+        }];
+        let rosters = vec![Roster {
+            roster_id: 1,
+            owner_id: Some("user-1".to_string()),
+            players: Some(vec![
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+            ]),
+            starters: Some(vec!["1".to_string()]),
+            settings: Some(RosterSettings {
+                wins: Some(0),
+                losses: Some(0),
+                ties: Some(0),
+                fpts: None,
+                fpts_decimal: None,
+                fpts_against: None,
+                fpts_against_decimal: None,
+            }),
+        }];
+        let roster_names = HashMap::from([(1, "Nick (Touchdown Tyrants)".to_string())]);
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        let projections = HashMap::from([
+            (
+                "1".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(14.2),
+                    ..PlayerStats::default()
+                },
+            ),
+            (
+                "2".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(8.7),
+                    ..PlayerStats::default()
+                },
+            ),
+            (
+                "3".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(11.5),
+                    ..PlayerStats::default()
+                },
+            ),
+            (
+                "4".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(20.0),
+                    ..PlayerStats::default()
+                },
+            ),
+        ]);
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor
+            .compare_start_options("Touchdown", "FLEX")
+            .unwrap();
+        // QB excluded; sorted by projected points descending.
+        assert!(!result.contains("Backup QB"));
+        let starter_idx = result.find("Starter RB").expect("starter listed");
+        let wr_idx = result.find("Bench WR").expect("WR listed");
+        let bench_rb_idx = result.find("Bench RB").expect("bench RB listed");
+        assert!(starter_idx < wr_idx);
+        assert!(wr_idx < bench_rb_idx);
+        assert!(result.contains("Starter, Questionable (knee)"));
+        assert!(result.contains("Bench, Healthy"));
     }
 
     #[test]

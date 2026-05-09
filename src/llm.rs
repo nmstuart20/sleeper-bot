@@ -1,5 +1,11 @@
 /// Build the trade analysis system prompt for a given character.
-pub fn trade_system_prompt(character: &str, league_rules: &str) -> String {
+///
+/// `league_format` is the auto-derived single-line summary of the league
+/// produced by `sleeper::League::format_summary` — it captures team count,
+/// dynasty/redraft, lineup slots (including superflex / multiple flexes), and
+/// scoring rules from the Sleeper API, optionally followed by free-form notes
+/// from `config.toml`.
+pub fn trade_system_prompt(character: &str, league_format: &str) -> String {
     let today = chrono::Local::now().format("%B %d, %Y");
     let year = chrono::Local::now().format("%Y");
     format!(
@@ -17,15 +23,19 @@ You are {character} and you are the league's official trade analyst bot for a dy
 - CRITICAL: Do not state any player's current team, injury status, depth chart position, or recent stats from your own knowledge. ALWAYS use get_player_info first. Your training data may be months out of date — players get traded, injured, and cut constantly.
 - Also use get_league_standings and get_team_roster if you need more context on the teams involved.
 - Consider dynasty value: young upside vs aging vets, rebuilding vs contending windows
+- Tailor your analysis to the league format below — superflex elevates QB value, TE premium scoring boosts TEs, deep starting lineups make depth more valuable, etc.
 - Talk like {character} would — use their mannerisms, catchphrases, and personality
-- League rules: {league_rules}
+- League format: {league_format}
 
 Keep the response under 1500 characters. This posts to Sleeper league chat on mobile — short paragraphs, punchy sentences, no headers or markdown."#
     )
 }
 
 /// Build the system prompt for responding to @mentions in league chat (agent/tool-use mode).
-pub fn chat_system_prompt(league_rules: &str) -> String {
+///
+/// `league_format` is the auto-derived single-line summary of the league
+/// (see `sleeper::League::format_summary`).
+pub fn chat_system_prompt(league_format: &str) -> String {
     let today = chrono::Local::now().format("%B %d, %Y");
     let year = chrono::Local::now().format("%Y");
     format!(
@@ -35,7 +45,7 @@ You are an AI assistant for a dynasty fantasy football league on Sleeper. You ar
 
 You have access to tools that let you look up league standings, team rosters, player info, waiver wire, recent transactions, matchups, past season results, and league history. You can also search the web for current NFL news, injury updates, trade rumors, and breaking stories. Use these tools to answer questions with real data. Call multiple tools if needed to give a thorough answer. Don't guess — look it up.
 
-League rules: {league_rules}
+League format: {league_format}
 
 Rules:
 - Always use tools to get current data before answering — don't rely on assumptions

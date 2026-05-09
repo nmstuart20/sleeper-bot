@@ -1,7 +1,14 @@
-# League rules — these are injected into LLM prompts so the bot understands your league format.
+# League format and scoring are auto-detected from the Sleeper API
+# (roster_positions + scoring_settings), so you only need to fill in `rules` if
+# you want to add free-form notes the API doesn't expose (payouts, custom
+# keeper format, divisional setup, etc.). Both `rules` and `scoring` are
+# optional — leave them blank or remove them entirely to use the API values.
+
 [league]
+# Optional free-form notes appended to the auto-derived format summary.
 rules = "10 team superflex, full ppr league with deep 14 player benches, 2 IR spots and 3 taxi spots"
-# Scoring format for fantasy points: "half_ppr", "ppr", or "std"
-scoring = "ppr"
+# Optional scoring override: "half_ppr", "ppr", or "std". If unset, the bot
+# derives this from scoring_settings.rec on the league (0 = std, 0.5 = half_ppr, 1 = ppr).
+# scoring = "ppr"
 # Bot's Sleeper username — used to detect @mentions in chat
 bot_username = "tradebot123"

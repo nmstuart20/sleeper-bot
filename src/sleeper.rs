@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 const BASE_URL: &str = "https://api.sleeper.app/v1";
@@ -123,6 +123,206 @@ pub struct League {
     pub roster_positions: Option<Vec<String>>,
     pub scoring_settings: Option<HashMap<String, f64>>,
     pub settings: Option<LeagueSettings>,
+}
+
+impl League {
+    /// Derive the scoring format ("ppr" / "half_ppr" / "std") from the
+    /// league's `scoring_settings.rec` value. Falls back to "half_ppr" if the
+    /// API didn't return scoring settings.
+    pub fn detect_scoring(&self) -> &'static str {
+        let rec = self
+            .scoring_settings
+            .as_ref()
+            .and_then(|s| s.get("rec").copied())
+            .unwrap_or(0.5);
+        // Allow a small epsilon for float comparisons.
+        if rec >= 0.99 {
+            "ppr"
+        } else if rec >= 0.49 {
+            "half_ppr"
+        } else if rec >= 0.01 {
+            // Some leagues use 0.25 PPR — round to half_ppr for the projections lookup.
+            "half_ppr"
+        } else {
+            "std"
+        }
+    }
+
+    /// True if any starter slot allows two QBs (i.e. SUPER_FLEX / SF / Q-FLEX).
+    pub fn is_superflex(&self) -> bool {
+        self.roster_positions
+            .as_ref()
+            .map(|positions| {
+                positions.iter().any(|p| {
+                    let upper = p.to_uppercase();
+                    upper == "SUPER_FLEX" || upper == "SF" || upper == "Q-FLEX" || upper == "QFLEX"
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build a compact, ordered summary of `roster_positions` like
+    /// "1 QB, 2 RB, 3 WR, 1 TE, 1 SUPER_FLEX, 1 FLEX, 1 K, 1 DEF, 14 BN, 2 IR".
+    pub fn format_roster_positions(&self) -> String {
+        let positions = match self.roster_positions.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return "Unknown roster format".to_string(),
+        };
+
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for slot in positions {
+            *counts.entry(slot.to_uppercase()).or_insert(0) += 1;
+        }
+
+        // Stable display order: starters first, then flexes, K/DEF/IDP, then bench/IR/taxi.
+        const ORDER: &[&str] = &[
+            "QB",
+            "RB",
+            "WR",
+            "TE",
+            "SUPER_FLEX",
+            "SF",
+            "Q-FLEX",
+            "QFLEX",
+            "REC_FLEX",
+            "WRRB_FLEX",
+            "FLEX",
+            "K",
+            "DEF",
+            "DL",
+            "LB",
+            "DB",
+            "IDP_FLEX",
+            "BN",
+            "IR",
+            "TAXI",
+        ];
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut emitted: HashSet<String> = HashSet::new();
+        for key in ORDER {
+            if let Some(n) = counts.get(*key) {
+                parts.push(format!("{n} {key}"));
+                emitted.insert((*key).to_string());
+            }
+        }
+        // Append any unrecognised slots in alphabetical order so we don't lose info.
+        let mut leftover: Vec<(&String, &u32)> = counts
+            .iter()
+            .filter(|(k, _)| !emitted.contains(k.as_str()))
+            .collect();
+        leftover.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, n) in leftover {
+            parts.push(format!("{n} {k}"));
+        }
+
+        parts.join(", ")
+    }
+
+    /// Pick out the most useful scoring rules for the LLM (PPR amount, pass TD
+    /// value, TE premium, big yardage bonuses). Returns `None` if nothing
+    /// non-default is worth highlighting.
+    pub fn format_scoring_highlights(&self) -> Option<String> {
+        let s = self.scoring_settings.as_ref()?;
+        let mut parts: Vec<String> = Vec::new();
+
+        // Reception value
+        let rec = s.get("rec").copied().unwrap_or(0.0);
+        if rec >= 0.99 {
+            parts.push("full PPR".to_string());
+        } else if rec >= 0.49 {
+            parts.push("half PPR".to_string());
+        } else if rec >= 0.01 {
+            parts.push(format!("{rec} PPR"));
+        } else {
+            parts.push("standard (no PPR)".to_string());
+        }
+
+        // Passing TD value (4 vs 6 is the big one)
+        let pass_td = s.get("pass_td").copied().unwrap_or(4.0);
+        if (pass_td - 4.0).abs() > 0.01 {
+            parts.push(format!("{pass_td:.0}pt pass TDs"));
+        }
+
+        // TE premium
+        if let Some(bonus) = s.get("bonus_rec_te").copied()
+            && bonus > 0.01
+        {
+            parts.push(format!("+{bonus} TE premium"));
+        }
+
+        // Big-game receiving yardage bonuses
+        for (key, label) in [
+            ("bonus_rec_yd_100", "100+ rec yds"),
+            ("bonus_rec_yd_200", "200+ rec yds"),
+            ("bonus_rush_yd_100", "100+ rush yds"),
+            ("bonus_rush_yd_200", "200+ rush yds"),
+            ("bonus_pass_yd_300", "300+ pass yds"),
+            ("bonus_pass_yd_400", "400+ pass yds"),
+        ] {
+            if let Some(v) = s.get(key).copied()
+                && v > 0.01
+            {
+                parts.push(format!("+{v} {label}"));
+            }
+        }
+
+        Some(parts.join(", "))
+    }
+
+    /// Build a single-line league summary suitable for injecting into LLM
+    /// system prompts:
+    ///   "10-team superflex dynasty league. Lineup: 1 QB, 2 RB, ... Bench/IR/Taxi
+    ///    counted. Scoring: full PPR, 6pt pass TDs, +0.5 TE premium."
+    /// `extra_rules` is appended verbatim if provided (free-form notes from
+    /// `config.toml` for things the API doesn't expose, e.g. payouts).
+    pub fn format_summary(&self, extra_rules: Option<&str>) -> String {
+        let team_count = self
+            .total_rosters
+            .or_else(|| self.settings.as_ref().and_then(|s| s.num_teams))
+            .unwrap_or(0);
+
+        let league_kind = self
+            .settings
+            .as_ref()
+            .map(|s| match s.league_type {
+                Some(2) => "dynasty",
+                Some(1) => "keeper",
+                Some(0) => "redraft",
+                _ => "fantasy",
+            })
+            .unwrap_or("fantasy");
+
+        let superflex_label = if self.is_superflex() {
+            " superflex"
+        } else {
+            ""
+        };
+
+        let mut summary = if team_count > 0 {
+            format!("{team_count}-team{superflex_label} {league_kind} league.")
+        } else {
+            format!("{league_kind} league.")
+        };
+
+        let lineup = self.format_roster_positions();
+        if !lineup.is_empty() && lineup != "Unknown roster format" {
+            summary.push_str(&format!(" Lineup: {lineup}."));
+        }
+
+        if let Some(highlights) = self.format_scoring_highlights() {
+            summary.push_str(&format!(" Scoring: {highlights}."));
+        }
+
+        if let Some(notes) = extra_rules {
+            let trimmed = notes.trim();
+            if !trimmed.is_empty() {
+                summary.push_str(&format!(" Additional notes: {trimmed}"));
+            }
+        }
+
+        summary
+    }
 }
 
 /// League-level settings from the Sleeper API.
@@ -942,6 +1142,188 @@ mod tests {
         assert!(!tx.is_completed_trade());
     }
 
+    fn build_league(
+        roster_positions: Option<Vec<&str>>,
+        scoring: Option<Vec<(&str, f64)>>,
+        league_type: Option<u32>,
+        total_rosters: Option<u32>,
+    ) -> League {
+        let settings = LeagueSettings {
+            num_teams: total_rosters,
+            playoff_teams: None,
+            playoff_week_start: None,
+            playoff_type: None,
+            trade_deadline: None,
+            trade_review_days: None,
+            pick_trading: None,
+            waiver_type: None,
+            waiver_budget: None,
+            taxi_slots: None,
+            taxi_years: None,
+            taxi_allow_vets: None,
+            reserve_slots: None,
+            bench_lock: None,
+            best_ball: None,
+            disable_trades: None,
+            offseason_adds: None,
+            draft_rounds: None,
+            league_type,
+            position_limit_qb: None,
+        };
+        League {
+            league_id: Some("123".to_string()),
+            name: Some("Test League".to_string()),
+            season: Some("2026".to_string()),
+            status: Some("in_season".to_string()),
+            previous_league_id: None,
+            total_rosters,
+            roster_positions: roster_positions
+                .map(|v| v.into_iter().map(|s| s.to_string()).collect()),
+            scoring_settings: scoring.map(|pairs| {
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect()
+            }),
+            settings: Some(settings),
+        }
+    }
+
+    #[test]
+    fn test_detect_scoring_from_rec_value() {
+        assert_eq!(
+            build_league(None, Some(vec![("rec", 1.0)]), None, None).detect_scoring(),
+            "ppr"
+        );
+        assert_eq!(
+            build_league(None, Some(vec![("rec", 0.5)]), None, None).detect_scoring(),
+            "half_ppr"
+        );
+        assert_eq!(
+            build_league(None, Some(vec![("rec", 0.25)]), None, None).detect_scoring(),
+            "half_ppr"
+        );
+        assert_eq!(
+            build_league(None, Some(vec![("rec", 0.0)]), None, None).detect_scoring(),
+            "std"
+        );
+        // Falls back to half_ppr when scoring_settings is missing.
+        assert_eq!(build_league(None, None, None, None).detect_scoring(), "half_ppr");
+    }
+
+    #[test]
+    fn test_is_superflex() {
+        let sf = build_league(
+            Some(vec!["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "K", "DEF"]),
+            None,
+            None,
+            None,
+        );
+        assert!(sf.is_superflex());
+
+        let std = build_league(
+            Some(vec!["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF"]),
+            None,
+            None,
+            None,
+        );
+        assert!(!std.is_superflex());
+    }
+
+    #[test]
+    fn test_format_roster_positions_orders_starters_first() {
+        let league = build_league(
+            Some(vec![
+                "QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "K", "DEF", "BN",
+                "BN", "BN", "BN", "IR", "IR",
+            ]),
+            None,
+            None,
+            None,
+        );
+        let formatted = league.format_roster_positions();
+        // Starters appear in canonical order, FLEX after SUPER_FLEX, BN/IR last.
+        assert_eq!(
+            formatted,
+            "1 QB, 2 RB, 3 WR, 1 TE, 1 SUPER_FLEX, 1 FLEX, 1 K, 1 DEF, 4 BN, 2 IR"
+        );
+    }
+
+    #[test]
+    fn test_format_roster_positions_handles_unknown_slots() {
+        let league = build_league(Some(vec!["QB", "WEIRD_SLOT", "BN"]), None, None, None);
+        let formatted = league.format_roster_positions();
+        assert!(formatted.starts_with("1 QB"));
+        assert!(formatted.contains("WEIRD_SLOT"));
+        assert!(formatted.contains("BN"));
+    }
+
+    #[test]
+    fn test_format_scoring_highlights_full_ppr_with_te_premium() {
+        let league = build_league(
+            None,
+            Some(vec![
+                ("rec", 1.0),
+                ("pass_td", 6.0),
+                ("bonus_rec_te", 0.5),
+                ("bonus_rec_yd_100", 3.0),
+            ]),
+            None,
+            None,
+        );
+        let highlights = league.format_scoring_highlights().unwrap();
+        assert!(highlights.contains("full PPR"));
+        assert!(highlights.contains("6pt pass TDs"));
+        assert!(highlights.contains("+0.5 TE premium"));
+        assert!(highlights.contains("100+ rec yds"));
+    }
+
+    #[test]
+    fn test_format_scoring_highlights_standard_no_extras() {
+        let league = build_league(
+            None,
+            Some(vec![("rec", 0.0), ("pass_td", 4.0)]),
+            None,
+            None,
+        );
+        let highlights = league.format_scoring_highlights().unwrap();
+        // Standard scoring with default 4pt pass TDs — only the PPR label is emitted.
+        assert_eq!(highlights, "standard (no PPR)");
+    }
+
+    #[test]
+    fn test_format_summary_dynasty_superflex_full_ppr() {
+        let league = build_league(
+            Some(vec![
+                "QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "K", "DEF", "BN",
+                "BN", "BN",
+            ]),
+            Some(vec![("rec", 1.0), ("pass_td", 6.0), ("bonus_rec_te", 0.5)]),
+            Some(2),
+            Some(10),
+        );
+        let summary = league.format_summary(None);
+        assert!(summary.starts_with("10-team superflex dynasty league."));
+        assert!(summary.contains("Lineup: 1 QB, 2 RB, 3 WR, 1 TE, 1 SUPER_FLEX, 1 FLEX, 1 K, 1 DEF, 3 BN."));
+        assert!(summary.contains("Scoring: full PPR, 6pt pass TDs, +0.5 TE premium."));
+        assert!(!summary.contains("Additional notes"));
+    }
+
+    #[test]
+    fn test_format_summary_appends_extra_rules() {
+        let league = build_league(
+            Some(vec!["QB", "RB", "WR", "FLEX", "K", "DEF", "BN"]),
+            Some(vec![("rec", 0.5)]),
+            Some(0),
+            Some(12),
+        );
+        let summary = league.format_summary(Some("$100 buy-in, payouts top 4."));
+        assert!(summary.contains("12-team redraft league."));
+        assert!(!summary.contains("superflex"));
+        assert!(summary.contains("half PPR"));
+        assert!(summary.contains("Additional notes: $100 buy-in, payouts top 4."));
+    }
+
     #[ignore]
     #[tokio::test]
     async fn test_real_sleeper_api() {
@@ -950,5 +1332,113 @@ mod tests {
         let state = client.get_nfl_state().await.unwrap();
         assert!(!state.season.is_empty());
         println!("NFL State: week={}, season={}", state.week, state.season);
+    }
+
+    /// Hits the live Sleeper API for the user's configured league
+    /// (`SLEEPER_LEAGUE_ID` from the environment / .env) and verifies that
+    /// the league-format helpers produce non-trivial output. Run with:
+    ///   cargo test --no-fail-fast -- --ignored --nocapture sleeper::tests::test_real_league_format
+    #[ignore]
+    #[tokio::test]
+    async fn test_real_league_format() {
+        // Pull league_id from .env / environment, matching how main.rs sources it.
+        let _ = dotenvy::dotenv();
+        let league_id = match std::env::var("SLEEPER_LEAGUE_ID") {
+            Ok(id) if !id.is_empty() => id,
+            _ => {
+                eprintln!(
+                    "Skipping test_real_league_format: SLEEPER_LEAGUE_ID is not set in the environment or .env"
+                );
+                return;
+            }
+        };
+
+        let client = SleeperClient::new();
+        let league = client
+            .get_league(&league_id)
+            .await
+            .expect("get_league should succeed for a real league_id");
+
+        // The league should round-trip with at least the basic identity fields populated.
+        assert_eq!(
+            league.league_id.as_deref(),
+            Some(league_id.as_str()),
+            "round-tripped league_id should match the request"
+        );
+        assert!(
+            league.name.as_deref().is_some_and(|n| !n.is_empty()),
+            "league.name should be populated by the API"
+        );
+
+        // Roster positions should be present and non-empty for any real league.
+        let positions = league
+            .roster_positions
+            .as_ref()
+            .expect("roster_positions should be present on a real league");
+        assert!(
+            !positions.is_empty(),
+            "roster_positions should not be empty"
+        );
+
+        // Scoring settings should also come back populated.
+        let scoring_settings = league
+            .scoring_settings
+            .as_ref()
+            .expect("scoring_settings should be present on a real league");
+        assert!(
+            !scoring_settings.is_empty(),
+            "scoring_settings should not be empty"
+        );
+
+        // detect_scoring must return one of the three known formats.
+        let scoring = league.detect_scoring();
+        assert!(
+            matches!(scoring, "ppr" | "half_ppr" | "std"),
+            "detect_scoring returned unexpected value: {scoring}"
+        );
+
+        // The roster format should mention at least one canonical starter slot
+        // and have a digit count prefix (e.g. "1 QB").
+        let roster_fmt = league.format_roster_positions();
+        assert!(!roster_fmt.is_empty(), "roster format should not be empty");
+        assert_ne!(
+            roster_fmt, "Unknown roster format",
+            "roster format should be derived from real data"
+        );
+        assert!(
+            roster_fmt.contains("QB")
+                || roster_fmt.contains("RB")
+                || roster_fmt.contains("WR")
+                || roster_fmt.contains("TE"),
+            "roster format should mention at least one offensive starter slot, got: {roster_fmt}"
+        );
+
+        // The full summary should include the team count, lineup, and scoring.
+        let summary = league.format_summary(None);
+        assert!(summary.contains("Lineup:"), "summary missing Lineup: {summary}");
+        assert!(summary.contains("Scoring:"), "summary missing Scoring: {summary}");
+
+        // Sanity-check the superflex flag against the raw positions.
+        let raw_has_sf = positions.iter().any(|p| {
+            let u = p.to_uppercase();
+            u == "SUPER_FLEX" || u == "SF" || u == "Q-FLEX" || u == "QFLEX"
+        });
+        assert_eq!(league.is_superflex(), raw_has_sf);
+        if raw_has_sf {
+            assert!(
+                summary.contains("superflex"),
+                "summary should mention superflex when SF slot exists, got: {summary}"
+            );
+        }
+
+        // Print everything so a developer running with --nocapture can eyeball it.
+        println!("League: {}", league.name.as_deref().unwrap_or(""));
+        println!("  Detected scoring: {scoring}");
+        println!("  Roster format:    {roster_fmt}");
+        println!("  Superflex:        {}", league.is_superflex());
+        if let Some(highlights) = league.format_scoring_highlights() {
+            println!("  Scoring highlights: {highlights}");
+        }
+        println!("  Full summary:     {summary}");
     }
 }

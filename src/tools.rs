@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use crate::graphql::SleeperGraphql;
 use crate::sleeper;
 use crate::sleeper::{
-    AllTimeUserStats, NflState, Player, PlayerSeasonEntry, PlayerStats, Roster, SeasonChampion,
-    SleeperClient, Transaction, User,
+    AllTimeUserStats, League, NflState, Player, PlayerSeasonEntry, PlayerStats, Roster,
+    SeasonChampion, SleeperClient, Transaction, User,
 };
 
 fn normalize_name(name: &str) -> String {
@@ -199,25 +199,7 @@ fn tool_definition(tool: &str) -> Value {
                 "required": ["seasons_ago"]
             }
         }),
-        "compare_start_options" => json!({
-            "name": "compare_start_options",
-            "description": "Compare fantasy start options for a specific team at a given position. Returns each eligible player with their projected points, recent performance, injury status, and a recommendation. Use this when someone asks 'who should I start at flex/RB/WR?' etc.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "team_name": {
-                        "type": "string",
-                        "description": "The team or owner name to look up (fuzzy matched against display names and team names)"
-                    },
-                    "position": {
-                        "type": "string",
-                        "description": "Position to compare. Use FLEX to include RB/WR/TE eligible options.",
-                        "enum": ["QB", "RB", "WR", "TE", "K", "FLEX"]
-                    }
-                },
-                "required": ["team_name", "position"]
-            }
-        }),
+        "compare_start_options" => compare_start_options_definition(None),
         "search_league_messages" => json!({
             "name": "search_league_messages",
             "description": "Search through the league's chat message history. Use this when someone asks about what a league member said in the past, such as bets, predictions, claims, trash talk, or any prior statements. You can filter by username, keyword/phrase, and/or date range. Returns up to 1000 messages worth of history.",
@@ -253,8 +235,70 @@ fn tool_definition(tool: &str) -> Value {
     }
 }
 
-/// Returns all tool definitions as a Vec suitable for the Anthropic API `tools` parameter.
-pub fn all_tool_definitions() -> Vec<Value> {
+/// Build the `compare_start_options` schema. When a `League` is supplied, the
+/// `position` enum is restricted to that league's actual starter slot labels
+/// (e.g. SUPER_FLEX, WRRB_FLEX) and the description spells out which NFL
+/// positions are eligible for each. Without a league we fall back to the
+/// generic enum so the schema is still well-formed (used by tests and by the
+/// fallback path when the API hasn't returned roster_positions).
+fn compare_start_options_definition(league: Option<&League>) -> Value {
+    let starter_slots: Vec<String> = league
+        .map(|l| l.starter_slot_labels())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            ["QB", "RB", "WR", "TE", "K", "DEF", "FLEX"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        });
+
+    // Annotate flex-style slots with their eligible base positions so the
+    // model knows what FLEX/SUPER_FLEX/WRRB_FLEX mean for *this* league.
+    let mut slot_descriptions: Vec<String> = Vec::new();
+    for slot in &starter_slots {
+        let eligible = League::eligible_positions_for_slot(slot);
+        if eligible.len() > 1 {
+            slot_descriptions.push(format!("{} ({})", slot, eligible.join("/")));
+        }
+    }
+    let extras = if slot_descriptions.is_empty() {
+        String::new()
+    } else {
+        format!(" Multi-position slots in this league: {}.", slot_descriptions.join(", "))
+    };
+
+    let description = format!(
+        "Compare fantasy start options for a specific team at a given lineup slot. \
+         Returns each eligible player with their projected points, injury status, \
+         and starter/bench info. Use this when someone asks 'who should I start at flex/RB/WR?' etc.\
+         {extras}"
+    );
+
+    json!({
+        "name": "compare_start_options",
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_name": {
+                    "type": "string",
+                    "description": "The team or owner name to look up (fuzzy matched against display names and team names)"
+                },
+                "position": {
+                    "type": "string",
+                    "description": "The lineup slot to compare. Must be one of this league's starter slots.",
+                    "enum": starter_slots,
+                }
+            },
+            "required": ["team_name", "position"]
+        }
+    })
+}
+
+/// Returns all tool definitions as a Vec suitable for the Anthropic API `tools`
+/// parameter. Pass the league so league-aware tools (e.g. `compare_start_options`)
+/// can advertise the actual lineup slots.
+pub fn all_tool_definitions(league: Option<&League>) -> Vec<Value> {
     vec![
         tool_definition("get_league_standings"),
         tool_definition("get_team_roster"),
@@ -265,7 +309,7 @@ pub fn all_tool_definitions() -> Vec<Value> {
         tool_definition("get_league_history"),
         tool_definition("get_past_season_results"),
         tool_definition("search_league_messages"),
-        tool_definition("compare_start_options"),
+        compare_start_options_definition(league),
     ]
 }
 
@@ -283,8 +327,8 @@ fn to_gemini_function_declaration(anthropic_tool: &Value) -> Value {
 }
 
 /// Returns tool definitions in Gemini's format (array of `functionDeclarations`).
-pub fn all_gemini_tool_definitions() -> Vec<Value> {
-    all_tool_definitions()
+pub fn all_gemini_tool_definitions(league: Option<&League>) -> Vec<Value> {
+    all_tool_definitions(league)
         .iter()
         .map(to_gemini_function_declaration)
         .collect()
@@ -416,6 +460,7 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
 pub struct ToolExecutor<'a> {
     pub sleeper: &'a SleeperClient,
     pub league_id: &'a str,
+    pub league: &'a League,
     pub players: &'a HashMap<String, Player>,
     pub users: &'a [User],
     pub rosters: &'a [Roster],
@@ -727,18 +772,25 @@ impl<'a> ToolExecutor<'a> {
         };
 
         let pos_upper = position.to_uppercase();
-        let allowed: &[&str] = match pos_upper.as_str() {
-            "QB" => &["QB"],
-            "RB" => &["RB"],
-            "WR" => &["WR"],
-            "TE" => &["TE"],
-            "K" => &["K"],
-            "FLEX" => &["RB", "WR", "TE"],
-            _ => {
-                return Ok(format!(
-                    "Unsupported position \"{position}\". Use QB, RB, WR, TE, K, or FLEX."
-                ));
-            }
+
+        // Validate the slot against the league's actual roster_positions
+        // (pulled from the Sleeper API), so SUPER_FLEX / WRRB_FLEX / etc.
+        // resolve correctly per-league instead of via a hardcoded list.
+        let starter_slots = self.league.starter_slot_labels();
+        if !starter_slots.is_empty() && !starter_slots.iter().any(|s| s == &pos_upper) {
+            return Ok(format!(
+                "Unsupported lineup slot \"{position}\" for this league. Available starter slots: {}.",
+                starter_slots.join(", ")
+            ));
+        }
+
+        let resolved = League::eligible_positions_for_slot(&pos_upper);
+        let allowed: Vec<&str> = if resolved.is_empty() {
+            // Unknown slot label — fall back to matching the slot name itself
+            // so exotic IDP-style slots still surface something useful.
+            vec![pos_upper.as_str()]
+        } else {
+            resolved
         };
 
         let starter_ids: HashSet<&str> = roster
@@ -1616,9 +1668,31 @@ mod tests {
         }
     }
 
+    /// Build a stock single-flex league for tool tests that need to construct
+    /// a `ToolExecutor`. Tests that care about specific roster_positions should
+    /// build their own `League` instead.
+    fn test_league() -> League {
+        League {
+            league_id: Some("league".to_string()),
+            name: None,
+            season: None,
+            status: None,
+            previous_league_id: None,
+            total_rosters: Some(10),
+            roster_positions: Some(
+                ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "K", "DEF", "BN"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            scoring_settings: None,
+            settings: None,
+        }
+    }
+
     #[test]
     fn test_all_tool_definitions_count() {
-        let tools = all_tool_definitions();
+        let tools = all_tool_definitions(None);
         assert_eq!(tools.len(), 10);
         for tool in &tools {
             assert!(tool.get("name").is_some(), "Tool missing 'name'");
@@ -1631,6 +1705,46 @@ mod tests {
                 "Tool missing 'input_schema'"
             );
         }
+    }
+
+    #[test]
+    fn test_compare_start_options_definition_uses_league_slots() {
+        // Build a superflex league with FLEX + SUPER_FLEX + WRRB_FLEX.
+        let league = League {
+            league_id: Some("1".to_string()),
+            name: None,
+            season: None,
+            status: None,
+            previous_league_id: None,
+            total_rosters: Some(10),
+            roster_positions: Some(
+                ["QB","RB","RB","WR","WR","TE","FLEX","SUPER_FLEX","WRRB_FLEX","K","DEF","BN","BN","IR"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            scoring_settings: None,
+            settings: None,
+        };
+
+        let def = compare_start_options_definition(Some(&league));
+        let enum_vals = def["input_schema"]["properties"]["position"]["enum"]
+            .as_array()
+            .expect("enum should be present");
+        let enum_strs: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        // Bench/IR excluded; SUPER_FLEX present; no DEF if not in league (here it is).
+        assert!(enum_strs.contains(&"QB"));
+        assert!(enum_strs.contains(&"SUPER_FLEX"));
+        assert!(enum_strs.contains(&"FLEX"));
+        assert!(enum_strs.contains(&"WRRB_FLEX"));
+        assert!(enum_strs.contains(&"DEF"));
+        assert!(!enum_strs.contains(&"BN"));
+        assert!(!enum_strs.contains(&"IR"));
+
+        let desc = def["description"].as_str().unwrap();
+        assert!(desc.contains("SUPER_FLEX (QB/RB/WR/TE)"));
+        assert!(desc.contains("FLEX (RB/WR/TE)"));
+        assert!(desc.contains("WRRB_FLEX (RB/WR)"));
     }
 
     #[test]
@@ -1831,9 +1945,11 @@ mod tests {
         let all_time_stats = Vec::new();
         let recent_transactions = Vec::new();
 
+        let league = test_league();
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: "league",
+            league: &league,
             players: &players,
             users: &users,
             rosters: &rosters,
@@ -1979,9 +2095,11 @@ mod tests {
         let all_time_stats = Vec::new();
         let recent_transactions = Vec::new();
 
+        let league = test_league();
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: "league",
+            league: &league,
             players: &players,
             users: &users,
             rosters: &rosters,
@@ -2031,9 +2149,11 @@ mod tests {
         let all_time_stats = Vec::new();
         let recent_transactions = Vec::new();
 
+        let league = test_league();
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: "league",
+            league: &league,
             players: &players,
             users: &users,
             rosters: &rosters,
@@ -2096,9 +2216,11 @@ mod tests {
         let all_time_stats = Vec::new();
         let recent_transactions = Vec::new();
 
+        let league = test_league();
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: "league",
+            league: &league,
             players: &players,
             users: &users,
             rosters: &rosters,
@@ -2169,9 +2291,11 @@ mod tests {
         let all_time_stats = Vec::new();
         let recent_transactions = Vec::new();
 
+        let league = test_league();
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: "league",
+            league: &league,
             players: &players,
             users: &users,
             rosters: &rosters,

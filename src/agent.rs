@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::sleeper::League;
 use crate::tools::{self, ToolExecutor};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -97,8 +98,8 @@ pub struct ChatAgent {
 }
 
 impl ChatAgent {
-    pub fn new(api_key: String, system_prompt: String) -> Self {
-        let mut tool_defs = tools::all_tool_definitions();
+    pub fn new(api_key: String, system_prompt: String, league: Option<&League>) -> Self {
+        let mut tool_defs = tools::all_tool_definitions(league);
         // Add Anthropic's built-in web search server tool
         tool_defs.push(serde_json::json!({
             "type": "web_search_20250305",

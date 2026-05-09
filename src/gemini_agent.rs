@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::news;
+use crate::sleeper::League;
 use crate::tools::{self, ToolExecutor};
 
 const MODEL: &str = "gemini-2.5-flash";
@@ -103,8 +104,8 @@ pub struct GeminiChatAgent {
 }
 
 impl GeminiChatAgent {
-    pub fn new(api_key: String, system_prompt: String) -> Self {
-        let mut function_declarations = tools::all_gemini_tool_definitions();
+    pub fn new(api_key: String, system_prompt: String, league: Option<&League>) -> Self {
+        let mut function_declarations = tools::all_gemini_tool_definitions(league);
         // Add web_search as a client-side function (Gemini doesn't allow mixing
         // built-in google_search with function calling in the same request).
         function_declarations.push(serde_json::json!({

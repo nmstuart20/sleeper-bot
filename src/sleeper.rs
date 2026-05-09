@@ -161,6 +161,90 @@ impl League {
             .unwrap_or(false)
     }
 
+    /// Returns the league's unique starter slot labels (in canonical display
+    /// order), excluding bench-only slots (BN, IR, TAXI). Useful for building
+    /// the `compare_start_options` position enum and any other tool surface
+    /// that should reflect the league's actual lineup format.
+    pub fn starter_slot_labels(&self) -> Vec<String> {
+        let positions = match self.roster_positions.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return Vec::new(),
+        };
+
+        // Same canonical order used by `format_roster_positions`.
+        const ORDER: &[&str] = &[
+            "QB",
+            "RB",
+            "WR",
+            "TE",
+            "SUPER_FLEX",
+            "SF",
+            "Q-FLEX",
+            "QFLEX",
+            "REC_FLEX",
+            "WRRB_FLEX",
+            "FLEX",
+            "K",
+            "DEF",
+            "DL",
+            "LB",
+            "DB",
+            "IDP_FLEX",
+        ];
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for slot in positions {
+            let upper = slot.to_uppercase();
+            if matches!(upper.as_str(), "BN" | "IR" | "TAXI") {
+                continue;
+            }
+            seen.insert(upper);
+        }
+
+        let mut ordered: Vec<String> = Vec::new();
+        let mut emitted: HashSet<&str> = HashSet::new();
+        for key in ORDER {
+            if seen.contains(*key) {
+                ordered.push((*key).to_string());
+                emitted.insert(key);
+            }
+        }
+        // Append any unrecognised starter slots alphabetically so the LLM can
+        // still target them.
+        let mut leftover: Vec<&String> =
+            seen.iter().filter(|k| !emitted.contains(k.as_str())).collect();
+        leftover.sort();
+        for k in leftover {
+            ordered.push(k.clone());
+        }
+
+        ordered
+    }
+
+    /// Map a starter slot label (e.g. `FLEX`, `SUPER_FLEX`, `WRRB_FLEX`) to
+    /// the set of NFL positions that are eligible to fill it. Matches Sleeper's
+    /// own slot semantics; an unknown slot falls back to itself (so an exotic
+    /// slot still surfaces players whose `position` matches the slot name).
+    pub fn eligible_positions_for_slot(slot: &str) -> Vec<&'static str> {
+        match slot.to_uppercase().as_str() {
+            "QB" => vec!["QB"],
+            "RB" => vec!["RB"],
+            "WR" => vec!["WR"],
+            "TE" => vec!["TE"],
+            "K" => vec!["K"],
+            "DEF" => vec!["DEF"],
+            "FLEX" => vec!["RB", "WR", "TE"],
+            "SUPER_FLEX" | "SF" | "Q-FLEX" | "QFLEX" => vec!["QB", "RB", "WR", "TE"],
+            "WRRB_FLEX" => vec!["RB", "WR"],
+            "REC_FLEX" => vec!["WR", "TE"],
+            "DL" => vec!["DL", "DE", "DT"],
+            "LB" => vec!["LB"],
+            "DB" => vec!["DB", "CB", "S"],
+            "IDP_FLEX" => vec!["DL", "DE", "DT", "LB", "DB", "CB", "S"],
+            _ => Vec::new(),
+        }
+    }
+
     /// Build a compact, ordered summary of `roster_positions` like
     /// "1 QB, 2 RB, 3 WR, 1 TE, 1 SUPER_FLEX, 1 FLEX, 1 K, 1 DEF, 14 BN, 2 IR".
     pub fn format_roster_positions(&self) -> String {
@@ -1335,9 +1419,7 @@ mod tests {
     }
 
     /// Hits the live Sleeper API for the user's configured league
-    /// (`SLEEPER_LEAGUE_ID` from the environment / .env) and verifies that
-    /// the league-format helpers produce non-trivial output. Run with:
-    ///   cargo test --no-fail-fast -- --ignored --nocapture sleeper::tests::test_real_league_format
+    /// cargo test --no-fail-fast -- --ignored --nocapture sleeper::tests::test_real_league_format
     #[ignore]
     #[tokio::test]
     async fn test_real_league_format() {

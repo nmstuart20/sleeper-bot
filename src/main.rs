@@ -169,7 +169,11 @@ async fn main() -> Result<()> {
     }
 }
 
-fn build_agent_runner(provider: &LlmProvider, system_prompt: &str) -> Result<AgentRunner> {
+fn build_agent_runner(
+    provider: &LlmProvider,
+    system_prompt: &str,
+    league: Option<&sleeper::League>,
+) -> Result<AgentRunner> {
     match provider {
         LlmProvider::Anthropic => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -177,6 +181,7 @@ fn build_agent_runner(provider: &LlmProvider, system_prompt: &str) -> Result<Age
             Ok(AgentRunner::Anthropic(ChatAgent::new(
                 api_key,
                 system_prompt.to_string(),
+                league,
             )))
         }
         LlmProvider::Gemini => {
@@ -185,6 +190,7 @@ fn build_agent_runner(provider: &LlmProvider, system_prompt: &str) -> Result<Age
             Ok(AgentRunner::Gemini(GeminiChatAgent::new(
                 api_key,
                 system_prompt.to_string(),
+                league,
             )))
         }
     }
@@ -210,8 +216,11 @@ async fn run_check(
     let league_format = league_data.league.format_summary(extra_rules);
     println!("Detected league format: {league_format}");
 
-    let agent =
-        build_agent_runner(provider, &llm::trade_system_prompt(character, &league_format))?;
+    let agent = build_agent_runner(
+        provider,
+        &llm::trade_system_prompt(character, &league_format),
+        Some(&league_data.league),
+    )?;
 
     let gql = if post {
         match setup_graphql() {
@@ -320,8 +329,11 @@ async fn run_watch(
     let league_format = initial_league.format_summary(extra_rules);
     println!("Detected league format: {league_format}");
 
-    let trade_agent =
-        build_agent_runner(provider, &llm::trade_system_prompt(character, &league_format))?;
+    let trade_agent = build_agent_runner(
+        provider,
+        &llm::trade_system_prompt(character, &league_format),
+        Some(&initial_league),
+    )?;
 
     let trade_interval = watch_config.trade_interval;
     let chat_interval = watch_config.chat_interval;
@@ -459,19 +471,20 @@ async fn chat_poll_loop(
     );
     let mut last_refresh = Instant::now();
 
-    // Set up agent for the chosen provider
+    // Set up agent for the chosen provider — pass the league so the
+    // compare_start_options tool advertises this league's actual lineup slots.
     let agent = match provider {
         LlmProvider::Anthropic => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
             let sys = llm::chat_system_prompt(league_format);
-            AgentRunner::Anthropic(ChatAgent::new(api_key, sys))
+            AgentRunner::Anthropic(ChatAgent::new(api_key, sys, Some(&league_data.league)))
         }
         LlmProvider::Gemini => {
             let api_key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
             let sys = llm::chat_system_prompt(league_format);
-            AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys))
+            AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys, Some(&league_data.league)))
         }
     };
 
@@ -528,6 +541,7 @@ async fn chat_poll_loop(
                     let executor = ToolExecutor {
                         sleeper: &sleeper,
                         league_id,
+                        league: &league_data.league,
                         players: &league_data.players,
                         users: &league_data.users,
                         rosters: &league_data.rosters,
@@ -643,19 +657,20 @@ async fn run_debug(
                 let api_key = std::env::var("ANTHROPIC_API_KEY")
                     .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
                 let sys = llm::chat_system_prompt(&league_format);
-                AgentRunner::Anthropic(ChatAgent::new(api_key, sys))
+                AgentRunner::Anthropic(ChatAgent::new(api_key, sys, Some(&league_data.league)))
             }
             LlmProvider::Gemini => {
                 let api_key = std::env::var("GEMINI_API_KEY")
                     .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
                 let sys = llm::chat_system_prompt(&league_format);
-                AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys))
+                AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys, Some(&league_data.league)))
             }
         };
 
         let executor = ToolExecutor {
             sleeper: &sleeper,
             league_id: &league_id,
+            league: &league_data.league,
             players: &league_data.players,
             users: &league_data.users,
             rosters: &league_data.rosters,
@@ -784,6 +799,7 @@ async fn process_trades(
         let executor = ToolExecutor {
             sleeper,
             league_id,
+            league: &league_data.league,
             players: &league_data.players,
             users: &league_data.users,
             rosters: &league_data.rosters,

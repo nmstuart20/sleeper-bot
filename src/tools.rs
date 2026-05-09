@@ -34,7 +34,10 @@ pub enum ToolName {
     /// Returns current league standings (team name, record, points for/against).
     GetLeagueStandings,
     /// Returns full roster (starters + bench) for a specific team, matched fuzzily.
-    GetTeamRoster { team_name: String },
+    GetTeamRoster {
+        team_name: String,
+        position: Option<String>,
+    },
     /// Returns detailed info for a named player: position, team, age, injury,
     /// depth chart, historical stats, and current projections.
     GetPlayerInfo { player_name: String },
@@ -62,6 +65,7 @@ pub enum ToolName {
         keyword: Option<String>,
         after_date: Option<String>,
         before_date: Option<String>,
+        limit: Option<u32>,
     },
 }
 
@@ -86,6 +90,11 @@ fn tool_definition(tool: &str) -> Value {
                     "team_name": {
                         "type": "string",
                         "description": "The team or owner name to look up (fuzzy matched against display names and team names)"
+                    },
+                    "position": {
+                        "type": "string",
+                        "description": "Optional: filter roster to only show players at this position (QB, RB, WR, TE, K, DEF). Useful for start/sit decisions or positional depth questions.",
+                        "enum": ["QB", "RB", "WR", "TE", "K", "DEF"]
                     }
                 },
                 "required": ["team_name"]
@@ -204,6 +213,11 @@ fn tool_definition(tool: &str) -> Value {
                     "before_date": {
                         "type": "string",
                         "description": "Optional: only include messages sent before this date (format: YYYY-MM-DD)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of matching messages to return (default: 15)",
+                        "default": 15
                     }
                 },
                 "required": []
@@ -259,8 +273,13 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
                 .get("team_name")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("get_team_roster requires 'team_name' (string)"))?;
+            let position = input
+                .get("position")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Ok(ToolName::GetTeamRoster {
                 team_name: team_name.to_string(),
+                position,
             })
         }
 
@@ -337,11 +356,13 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
                 .get("before_date")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let limit = input.get("limit").and_then(|v| v.as_u64()).map(|v| v as u32);
             Ok(ToolName::SearchLeagueMessages {
                 username,
                 keyword,
                 after_date,
                 before_date,
+                limit,
             })
         }
 
@@ -372,7 +393,9 @@ impl<'a> ToolExecutor<'a> {
     pub async fn execute(&self, tool: &ToolName) -> Result<String> {
         match tool {
             ToolName::GetLeagueStandings => self.get_league_standings(),
-            ToolName::GetTeamRoster { team_name } => self.get_team_roster(team_name),
+            ToolName::GetTeamRoster { team_name, position } => {
+                self.get_team_roster(team_name, position.as_deref())
+            }
             ToolName::GetPlayerInfo { player_name } => self.get_player_info(player_name),
             ToolName::SearchWaiverWire { position, limit } => {
                 self.search_waiver_wire(position.as_deref(), limit.unwrap_or(15))
@@ -390,12 +413,14 @@ impl<'a> ToolExecutor<'a> {
                 keyword,
                 after_date,
                 before_date,
+                limit,
             } => {
                 self.search_league_messages(
                     username.as_deref(),
                     keyword.as_deref(),
                     after_date.as_deref(),
                     before_date.as_deref(),
+                    limit.unwrap_or(15),
                 )
                 .await
             }
@@ -478,7 +503,7 @@ impl<'a> ToolExecutor<'a> {
         Ok(result)
     }
 
-    fn get_team_roster(&self, team_name: &str) -> Result<String> {
+    fn get_team_roster(&self, team_name: &str, position: Option<&str>) -> Result<String> {
         let normalized_query = normalize_name(team_name);
         let user_map: HashMap<&str, &User> =
             self.users.iter().map(|u| (u.user_id.as_str(), u)).collect();
@@ -537,6 +562,23 @@ impl<'a> ToolExecutor<'a> {
 
         let mut result = format!("{header} ({record})\n");
 
+        if let Some(pos) = position {
+            result.push_str(&format!("\nShowing {pos} only:\n"));
+        }
+
+        let position_filter = position.map(|p| p.to_uppercase());
+        let player_matches_filter = |id: &str| -> bool {
+            match position_filter.as_deref() {
+                None => true,
+                Some(filter) => self
+                    .players
+                    .get(id)
+                    .and_then(|p| p.position.as_deref())
+                    .map(|pos| pos.eq_ignore_ascii_case(filter))
+                    .unwrap_or(false),
+            }
+        };
+
         // Starters
         let starter_ids: Vec<&str> = roster
             .starters
@@ -549,9 +591,15 @@ impl<'a> ToolExecutor<'a> {
             })
             .unwrap_or_default();
 
-        if !starter_ids.is_empty() {
+        let filtered_starter_ids: Vec<&str> = starter_ids
+            .iter()
+            .copied()
+            .filter(|id| player_matches_filter(id))
+            .collect();
+
+        if !filtered_starter_ids.is_empty() {
             result.push_str("\nStarters:\n");
-            for id in &starter_ids {
+            for id in &filtered_starter_ids {
                 let name = self
                     .players
                     .get(*id)
@@ -573,6 +621,7 @@ impl<'a> ToolExecutor<'a> {
             .map(|ids| {
                 ids.iter()
                     .filter(|id| !starter_ids.contains(&id.as_str()))
+                    .filter(|id| player_matches_filter(id))
                     .filter_map(|id| {
                         self.players.get(id).map(|p| {
                             let pos = p.position.as_deref().unwrap_or("??");
@@ -1194,6 +1243,7 @@ impl<'a> ToolExecutor<'a> {
         keyword: Option<&str>,
         after_date: Option<&str>,
         before_date: Option<&str>,
+        limit: u32,
     ) -> Result<String> {
         let gql = self
             .gql
@@ -1326,12 +1376,26 @@ impl<'a> ToolExecutor<'a> {
             return Ok(desc);
         }
 
-        let mut result = format!(
-            "Found {} matching message(s) (searched {total_fetched} messages):\n\n",
-            all_matches.len()
-        );
+        let total_matches = all_matches.len();
+        let limit_usize = limit as usize;
+        let truncated = total_matches > limit_usize;
         // Show oldest first for chronological reading
         all_matches.reverse();
+        if truncated {
+            // After reversing, the oldest matches are first; keep the most recent `limit`
+            let drop = total_matches - limit_usize;
+            all_matches.drain(..drop);
+        }
+
+        let mut result = if truncated {
+            format!(
+                "Found {total_matches} matching message(s) (searched {total_fetched} messages, showing {limit_usize} of {total_matches} matches — refine your search for more specific results):\n\n"
+            )
+        } else {
+            format!(
+                "Found {total_matches} matching message(s) (searched {total_fetched} messages):\n\n"
+            )
+        };
         for m in &all_matches {
             result.push_str(m);
             result.push('\n');
@@ -1389,8 +1453,21 @@ mod tests {
     fn test_parse_get_team_roster() {
         let input = json!({"team_name": "Touchdown Tyrants"});
         match parse_tool_call("get_team_roster", &input).unwrap() {
-            ToolName::GetTeamRoster { team_name } => {
+            ToolName::GetTeamRoster { team_name, position } => {
                 assert_eq!(team_name, "Touchdown Tyrants");
+                assert!(position.is_none());
+            }
+            _ => panic!("Expected GetTeamRoster"),
+        }
+    }
+
+    #[test]
+    fn test_parse_get_team_roster_with_position() {
+        let input = json!({"team_name": "Touchdown Tyrants", "position": "RB"});
+        match parse_tool_call("get_team_roster", &input).unwrap() {
+            ToolName::GetTeamRoster { team_name, position } => {
+                assert_eq!(team_name, "Touchdown Tyrants");
+                assert_eq!(position, Some("RB".to_string()));
             }
             _ => panic!("Expected GetTeamRoster"),
         }
@@ -1434,6 +1511,38 @@ mod tests {
                 assert!(limit.is_none());
             }
             _ => panic!("Expected SearchWaiverWire"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_league_messages_with_limit() {
+        let input = json!({"keyword": "trade", "limit": 5});
+        match parse_tool_call("search_league_messages", &input).unwrap() {
+            ToolName::SearchLeagueMessages {
+                username,
+                keyword,
+                after_date,
+                before_date,
+                limit,
+            } => {
+                assert!(username.is_none());
+                assert_eq!(keyword, Some("trade".to_string()));
+                assert!(after_date.is_none());
+                assert!(before_date.is_none());
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("Expected SearchLeagueMessages"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_league_messages_no_limit() {
+        let input = json!({});
+        match parse_tool_call("search_league_messages", &input).unwrap() {
+            ToolName::SearchLeagueMessages { limit, .. } => {
+                assert!(limit.is_none());
+            }
+            _ => panic!("Expected SearchLeagueMessages"),
         }
     }
 
@@ -1656,8 +1765,83 @@ mod tests {
             gql: None,
         };
 
-        let result = executor.get_team_roster("dandre dogs").unwrap();
+        let result = executor.get_team_roster("dandre dogs", None).unwrap();
         assert!(result.contains("Nick (D'Andre Dogs) (3-1)"));
         assert!(result.contains("D'Andre Swift (RB, CHI)"));
+    }
+
+    #[test]
+    fn test_get_team_roster_position_filter() {
+        let sleeper = SleeperClient::new();
+        let players = HashMap::from([
+            (
+                "1".to_string(),
+                test_player("D'Andre", "Swift", "RB", Some("CHI")),
+            ),
+            (
+                "2".to_string(),
+                test_player("Patrick", "Mahomes", "QB", Some("KC")),
+            ),
+            (
+                "3".to_string(),
+                test_player("Justin", "Jefferson", "WR", Some("MIN")),
+            ),
+        ]);
+        let users = vec![User {
+            user_id: "user-1".to_string(),
+            display_name: Some("Nick".to_string()),
+            metadata: Some(UserMetadata {
+                team_name: Some("Touchdown Tyrants".to_string()),
+            }),
+        }];
+        let rosters = vec![Roster {
+            roster_id: 1,
+            owner_id: Some("user-1".to_string()),
+            players: Some(vec!["1".to_string(), "2".to_string(), "3".to_string()]),
+            starters: Some(vec!["2".to_string(), "1".to_string(), "3".to_string()]),
+            settings: Some(RosterSettings {
+                wins: Some(3),
+                losses: Some(1),
+                ties: Some(0),
+                fpts: None,
+                fpts_decimal: None,
+                fpts_against: None,
+                fpts_against_decimal: None,
+            }),
+        }];
+        let roster_names = HashMap::from([(1, "Nick (Touchdown Tyrants)".to_string())]);
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        let projections = HashMap::new();
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor.get_team_roster("Touchdown", Some("RB")).unwrap();
+        assert!(result.contains("Showing RB only:"));
+        assert!(result.contains("D'Andre Swift (RB, CHI)"));
+        assert!(!result.contains("Mahomes"));
+        assert!(!result.contains("Jefferson"));
     }
 }

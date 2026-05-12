@@ -484,7 +484,11 @@ async fn chat_poll_loop(
             let api_key = std::env::var("GEMINI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
             let sys = llm::chat_system_prompt(league_format);
-            AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys, Some(&league_data.league)))
+            AgentRunner::Gemini(GeminiChatAgent::new(
+                api_key,
+                sys,
+                Some(&league_data.league),
+            ))
         }
     };
 
@@ -663,7 +667,11 @@ async fn run_debug(
                 let api_key = std::env::var("GEMINI_API_KEY")
                     .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
                 let sys = llm::chat_system_prompt(&league_format);
-                AgentRunner::Gemini(GeminiChatAgent::new(api_key, sys, Some(&league_data.league)))
+                AgentRunner::Gemini(GeminiChatAgent::new(
+                    api_key,
+                    sys,
+                    Some(&league_data.league),
+                ))
             }
         };
 
@@ -727,6 +735,7 @@ fn setup_graphql() -> Result<SleeperGraphql> {
     SleeperGraphql::new(token)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_trades(
     league_id: &str,
     sleeper: &mut SleeperClient,

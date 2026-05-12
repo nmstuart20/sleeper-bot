@@ -28,6 +28,22 @@ fn format_player_match(player: &Player) -> String {
     format!("{} ({}, {})", player.full_name(), pos, team)
 }
 
+/// Result of a roster-needs analysis used by personalized waiver search.
+struct RosterNeeds {
+    team_header: String,
+    summary: String,
+    /// Positions where the team can't fill its dedicated starter slots
+    /// (e.g. league requires 2 RB starters but only 1 player at RB starts).
+    weak_positions: Vec<&'static str>,
+    /// Positions with 0–1 bench players — adequate starters but no depth.
+    thin_bench_positions: Vec<&'static str>,
+}
+
+enum RosterNeedsResult {
+    Found(RosterNeeds),
+    NotFound,
+}
+
 /// Represents each tool the LLM can call during an agentic conversation.
 #[derive(Debug, Clone)]
 pub enum ToolName {
@@ -42,10 +58,15 @@ pub enum ToolName {
     /// depth chart, historical stats, and current projections.
     GetPlayerInfo { player_name: String },
     /// Returns top unrostered players sorted by projected points,
-    /// optionally filtered by position (QB/RB/WR/TE/K/DEF).
+    /// optionally filtered by position (QB/RB/WR/TE/K/DEF). When `for_team`
+    /// is supplied, results are personalized to that team's roster needs:
+    /// the response is prefixed with a "Roster needs:" summary and the
+    /// recommendations are reordered so players at weak positions appear
+    /// first.
     SearchWaiverWire {
         position: Option<String>,
         limit: Option<u32>,
+        for_team: Option<String>,
     },
     /// Returns recent transactions, optionally filtered by type (trade/waiver/free_agent).
     GetRecentTransactions {
@@ -70,10 +91,7 @@ pub enum ToolName {
     /// Compares fantasy start options on a team's roster at a given position
     /// (or FLEX, which includes RB/WR/TE). Returns each eligible player with
     /// projected points, injury status, and starter/bench slot info.
-    CompareStartOptions {
-        team_name: String,
-        position: String,
-    },
+    CompareStartOptions { team_name: String, position: String },
 }
 
 /// Returns the Anthropic API tool JSON schema for each tool.
@@ -123,7 +141,7 @@ fn tool_definition(tool: &str) -> Value {
         }),
         "search_waiver_wire" => json!({
             "name": "search_waiver_wire",
-            "description": "Search for the best available unrostered players on the waiver wire, sorted by projected fantasy points. Optionally filter by position and limit the number of results. Use this when asked about waiver wire pickups, free agents, or available players at a position.",
+            "description": "Search for the best available unrostered players on the waiver wire, sorted by projected fantasy points. Optionally filter by position and limit the number of results. Use this when asked about waiver wire pickups, free agents, or available players at a position. Pass `for_team` to personalize the recommendations to a specific team — the response will be prefixed with a roster-needs summary and players at the team's weak positions will be surfaced first.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -136,6 +154,10 @@ fn tool_definition(tool: &str) -> Value {
                         "type": "integer",
                         "description": "Maximum number of players to return (default: 15)",
                         "default": 15
+                    },
+                    "for_team": {
+                        "type": "string",
+                        "description": "Optional: team/owner name to get personalized waiver recommendations based on their roster's weakest positions. When provided, the tool analyzes the team's roster depth at each position and prioritizes waiver picks that fill gaps."
                     }
                 },
                 "required": []
@@ -264,7 +286,10 @@ fn compare_start_options_definition(league: Option<&League>) -> Value {
     let extras = if slot_descriptions.is_empty() {
         String::new()
     } else {
-        format!(" Multi-position slots in this league: {}.", slot_descriptions.join(", "))
+        format!(
+            " Multi-position slots in this league: {}.",
+            slot_descriptions.join(", ")
+        )
     };
 
     let description = format!(
@@ -373,7 +398,15 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32);
-            Ok(ToolName::SearchWaiverWire { position, limit })
+            let for_team = input
+                .get("for_team")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Ok(ToolName::SearchWaiverWire {
+                position,
+                limit,
+                for_team,
+            })
         }
 
         "get_recent_transactions" => {
@@ -442,7 +475,10 @@ pub fn parse_tool_call(name: &str, input: &Value) -> Result<ToolName> {
                 .get("before_date")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let limit = input.get("limit").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let limit = input
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
             Ok(ToolName::SearchLeagueMessages {
                 username,
                 keyword,
@@ -480,13 +516,20 @@ impl<'a> ToolExecutor<'a> {
     pub async fn execute(&self, tool: &ToolName) -> Result<String> {
         match tool {
             ToolName::GetLeagueStandings => self.get_league_standings(),
-            ToolName::GetTeamRoster { team_name, position } => {
-                self.get_team_roster(team_name, position.as_deref())
-            }
+            ToolName::GetTeamRoster {
+                team_name,
+                position,
+            } => self.get_team_roster(team_name, position.as_deref()),
             ToolName::GetPlayerInfo { player_name } => self.get_player_info(player_name),
-            ToolName::SearchWaiverWire { position, limit } => {
-                self.search_waiver_wire(position.as_deref(), limit.unwrap_or(15))
-            }
+            ToolName::SearchWaiverWire {
+                position,
+                limit,
+                for_team,
+            } => self.search_waiver_wire(
+                position.as_deref(),
+                limit.unwrap_or(15),
+                for_team.as_deref(),
+            ),
             ToolName::GetRecentTransactions { tx_type, limit } => {
                 self.get_recent_transactions(tx_type.as_deref(), limit.unwrap_or(10))
             }
@@ -1007,7 +1050,12 @@ impl<'a> ToolExecutor<'a> {
         Ok(result)
     }
 
-    fn search_waiver_wire(&self, position: Option<&str>, limit: u32) -> Result<String> {
+    fn search_waiver_wire(
+        &self,
+        position: Option<&str>,
+        limit: u32,
+        for_team: Option<&str>,
+    ) -> Result<String> {
         let rostered: HashSet<&str> = self
             .rosters
             .iter()
@@ -1051,14 +1099,77 @@ impl<'a> ToolExecutor<'a> {
             })
             .collect();
 
-        available.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        // If no team-specific personalization, keep the existing
+        // best-projected-first ordering and output format.
+        let Some(team_query) = for_team else {
+            available.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+            if available.is_empty() {
+                let pos_note = position.map(|p| format!(" at {p}")).unwrap_or_default();
+                return Ok(format!("No available players found{pos_note}."));
+            }
+
+            let mut result = String::from("Top available players:\n");
+            for (i, (name, pos, team, pts)) in available.iter().take(limit as usize).enumerate() {
+                result.push_str(&format!(
+                    "{}. {} ({}, {}) — {:.1} proj pts\n",
+                    i + 1,
+                    name,
+                    pos,
+                    team,
+                    pts
+                ));
+            }
+            return Ok(result);
+        };
+
+        // Personalized path: locate the team, analyze roster needs, and
+        // re-order the waiver picks so weak positions surface first.
+        let needs = match self.compute_roster_needs(team_query) {
+            RosterNeedsResult::Found(n) => n,
+            RosterNeedsResult::NotFound => {
+                return Ok(format!("No team found matching \"{team_query}\"."));
+            }
+        };
 
         if available.is_empty() {
             let pos_note = position.map(|p| format!(" at {p}")).unwrap_or_default();
-            return Ok(format!("No available players found{pos_note}."));
+            return Ok(format!(
+                "Roster needs for {}: {}\nNo available players found{pos_note}.",
+                needs.team_header, needs.summary
+            ));
         }
 
-        let mut result = String::from("Top available players:\n");
+        // Bucket each available player by priority based on the team's needs.
+        // 0 = weak (starter slot gap), 1 = thin bench depth, 2 = everything else.
+        let bucket_for = |pos: &str| -> u8 {
+            if needs.weak_positions.contains(&pos) {
+                0
+            } else if needs.thin_bench_positions.contains(&pos) {
+                1
+            } else {
+                2
+            }
+        };
+
+        available.sort_by(|a, b| {
+            let ba = bucket_for(a.1);
+            let bb = bucket_for(b.1);
+            ba.cmp(&bb)
+                .then(b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        let mut result = format!(
+            "Roster needs for {}: {}\n",
+            needs.team_header, needs.summary
+        );
+        let has_priority =
+            !needs.weak_positions.is_empty() || !needs.thin_bench_positions.is_empty();
+        if has_priority {
+            result.push_str("Top available players (prioritized for this team's needs):\n");
+        } else {
+            result.push_str("Top available players:\n");
+        }
         for (i, (name, pos, team, pts)) in available.iter().take(limit as usize).enumerate() {
             result.push_str(&format!(
                 "{}. {} ({}, {}) — {:.1} proj pts\n",
@@ -1071,6 +1182,153 @@ impl<'a> ToolExecutor<'a> {
         }
 
         Ok(result)
+    }
+
+    /// Inspect a team's roster against the league's dedicated starter slots
+    /// and produce a human-readable "Roster needs:" summary plus the set of
+    /// weak and thin-bench positions used for ordering waiver recommendations.
+    fn compute_roster_needs(&self, team_query: &str) -> RosterNeedsResult {
+        let normalized_query = normalize_name(team_query);
+        let user_map: HashMap<&str, &User> =
+            self.users.iter().map(|u| (u.user_id.as_str(), u)).collect();
+
+        // Same fuzzy match used by get_team_roster / compare_start_options.
+        let matched_roster = self.rosters.iter().find(|r| {
+            let owner_id = match r.owner_id.as_deref() {
+                Some(id) => id,
+                None => return false,
+            };
+            let user = match user_map.get(owner_id) {
+                Some(u) => u,
+                None => return false,
+            };
+            let display = user.display_name.as_deref().unwrap_or("").to_lowercase();
+            let team = user
+                .metadata
+                .as_ref()
+                .and_then(|m| m.team_name.as_deref())
+                .unwrap_or("");
+            let normalized_display = normalize_name(display.as_str());
+            let normalized_team = normalize_name(team);
+
+            (!normalized_query.is_empty() && normalized_display.contains(&normalized_query))
+                || (!normalized_query.is_empty() && normalized_team.contains(&normalized_query))
+                || (!normalized_display.is_empty()
+                    && normalized_query.contains(&normalized_display))
+                || (!normalized_team.is_empty() && normalized_query.contains(&normalized_team))
+        });
+
+        let roster = match matched_roster {
+            Some(r) => r,
+            None => return RosterNeedsResult::NotFound,
+        };
+
+        let owner_id = roster.owner_id.as_deref().unwrap_or("");
+        let user = user_map.get(owner_id);
+        let display_name = user
+            .and_then(|u| u.display_name.as_deref())
+            .unwrap_or("Unknown");
+        let team_label = user
+            .and_then(|u| u.metadata.as_ref())
+            .and_then(|m| m.team_name.as_deref())
+            .unwrap_or("");
+        let team_header = if !team_label.is_empty() {
+            format!("{display_name} ({team_label})")
+        } else {
+            display_name.to_string()
+        };
+
+        // Count this team's starters at each position (skip empty "0" slots).
+        let starter_ids: HashSet<&str> = roster
+            .starters
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .filter(|id| id.as_str() != "0")
+                    .map(|s| s.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let position_of =
+            |id: &str| -> Option<&str> { self.players.get(id).and_then(|p| p.position.as_deref()) };
+
+        let mut starters_by_pos: HashMap<&str, u32> = HashMap::new();
+        for sid in &starter_ids {
+            if let Some(pos) = position_of(sid) {
+                *starters_by_pos.entry(pos).or_insert(0) += 1;
+            }
+        }
+
+        let mut bench_by_pos: HashMap<&str, u32> = HashMap::new();
+        if let Some(roster_players) = roster.players.as_ref() {
+            for pid in roster_players {
+                if starter_ids.contains(pid.as_str()) {
+                    continue;
+                }
+                if let Some(pos) = position_of(pid) {
+                    *bench_by_pos.entry(pos).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // League-required dedicated starters per position. Flex slots are
+        // intentionally ignored here — the goal is to flag positions where
+        // the team can't even fill its mandatory same-position slots.
+        let mut required_by_pos: HashMap<&str, u32> = HashMap::new();
+        if let Some(positions) = self.league.roster_positions.as_ref() {
+            for slot in positions {
+                let upper = slot.to_uppercase();
+                if matches!(upper.as_str(), "QB" | "RB" | "WR" | "TE" | "K" | "DEF") {
+                    // Map back to the canonical &'static str so the keys
+                    // align with positions stored on players.
+                    let canonical: &'static str = match upper.as_str() {
+                        "QB" => "QB",
+                        "RB" => "RB",
+                        "WR" => "WR",
+                        "TE" => "TE",
+                        "K" => "K",
+                        "DEF" => "DEF",
+                        _ => continue,
+                    };
+                    *required_by_pos.entry(canonical).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut summary_parts: Vec<String> = Vec::new();
+        let mut weak_positions: Vec<&'static str> = Vec::new();
+        let mut thin_bench_positions: Vec<&'static str> = Vec::new();
+
+        for pos in ["QB", "RB", "WR", "TE", "K", "DEF"] {
+            let starters_n = starters_by_pos.get(pos).copied().unwrap_or(0);
+            let bench_n = bench_by_pos.get(pos).copied().unwrap_or(0);
+            let required = required_by_pos.get(pos).copied().unwrap_or(0);
+
+            if required > 0 && starters_n < required {
+                summary_parts.push(format!(
+                    "Weak at {pos} ({starters_n} starter{}, {bench_n} bench).",
+                    if starters_n == 1 { "" } else { "s" }
+                ));
+                weak_positions.push(pos);
+            } else if required > 0 && bench_n <= 1 {
+                summary_parts.push(format!("{pos} depth is thin ({bench_n} bench).",));
+                thin_bench_positions.push(pos);
+            }
+        }
+
+        let summary = if summary_parts.is_empty() {
+            "Solid depth everywhere — no obvious gaps.".to_string()
+        } else {
+            summary_parts.join(" ")
+        };
+
+        RosterNeedsResult::Found(RosterNeeds {
+            team_header,
+            summary,
+            weak_positions,
+            thin_bench_positions,
+        })
     }
 
     fn get_recent_transactions(&self, tx_type: Option<&str>, limit: u32) -> Result<String> {
@@ -1718,10 +1976,25 @@ mod tests {
             previous_league_id: None,
             total_rosters: Some(10),
             roster_positions: Some(
-                ["QB","RB","RB","WR","WR","TE","FLEX","SUPER_FLEX","WRRB_FLEX","K","DEF","BN","BN","IR"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect(),
+                [
+                    "QB",
+                    "RB",
+                    "RB",
+                    "WR",
+                    "WR",
+                    "TE",
+                    "FLEX",
+                    "SUPER_FLEX",
+                    "WRRB_FLEX",
+                    "K",
+                    "DEF",
+                    "BN",
+                    "BN",
+                    "IR",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             ),
             scoring_settings: None,
             settings: None,
@@ -1764,7 +2037,10 @@ mod tests {
     fn test_parse_get_team_roster() {
         let input = json!({"team_name": "Touchdown Tyrants"});
         match parse_tool_call("get_team_roster", &input).unwrap() {
-            ToolName::GetTeamRoster { team_name, position } => {
+            ToolName::GetTeamRoster {
+                team_name,
+                position,
+            } => {
                 assert_eq!(team_name, "Touchdown Tyrants");
                 assert!(position.is_none());
             }
@@ -1776,7 +2052,10 @@ mod tests {
     fn test_parse_get_team_roster_with_position() {
         let input = json!({"team_name": "Touchdown Tyrants", "position": "RB"});
         match parse_tool_call("get_team_roster", &input).unwrap() {
-            ToolName::GetTeamRoster { team_name, position } => {
+            ToolName::GetTeamRoster {
+                team_name,
+                position,
+            } => {
                 assert_eq!(team_name, "Touchdown Tyrants");
                 assert_eq!(position, Some("RB".to_string()));
             }
@@ -1805,9 +2084,14 @@ mod tests {
     fn test_parse_search_waiver_wire_with_all_params() {
         let input = json!({"position": "RB", "limit": 5});
         match parse_tool_call("search_waiver_wire", &input).unwrap() {
-            ToolName::SearchWaiverWire { position, limit } => {
+            ToolName::SearchWaiverWire {
+                position,
+                limit,
+                for_team,
+            } => {
                 assert_eq!(position, Some("RB".to_string()));
                 assert_eq!(limit, Some(5));
+                assert!(for_team.is_none());
             }
             _ => panic!("Expected SearchWaiverWire"),
         }
@@ -1817,9 +2101,31 @@ mod tests {
     fn test_parse_search_waiver_wire_no_params() {
         let input = json!({});
         match parse_tool_call("search_waiver_wire", &input).unwrap() {
-            ToolName::SearchWaiverWire { position, limit } => {
+            ToolName::SearchWaiverWire {
+                position,
+                limit,
+                for_team,
+            } => {
                 assert!(position.is_none());
                 assert!(limit.is_none());
+                assert!(for_team.is_none());
+            }
+            _ => panic!("Expected SearchWaiverWire"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_waiver_wire_with_for_team() {
+        let input = json!({"for_team": "Touchdown Tyrants"});
+        match parse_tool_call("search_waiver_wire", &input).unwrap() {
+            ToolName::SearchWaiverWire {
+                position,
+                limit,
+                for_team,
+            } => {
+                assert!(position.is_none());
+                assert!(limit.is_none());
+                assert_eq!(for_team, Some("Touchdown Tyrants".to_string()));
             }
             _ => panic!("Expected SearchWaiverWire"),
         }
@@ -1964,9 +2270,7 @@ mod tests {
             gql: None,
         };
 
-        let result = executor
-            .compare_start_options("Touchdown", "FLEX")
-            .unwrap();
+        let result = executor.compare_start_options("Touchdown", "FLEX").unwrap();
         // QB excluded; sorted by projected points descending.
         assert!(!result.contains("Backup QB"));
         let starter_idx = result.find("Starter RB").expect("starter listed");
@@ -2315,5 +2619,217 @@ mod tests {
         assert!(result.contains("D'Andre Swift (RB, CHI)"));
         assert!(!result.contains("Mahomes"));
         assert!(!result.contains("Jefferson"));
+    }
+
+    #[test]
+    fn test_search_waiver_wire_personalized_surfaces_weak_position_first() {
+        use crate::sleeper::PlayerStats;
+
+        let sleeper = SleeperClient::new();
+        // Team rostered players: 1 QB starter, 1 RB starter, 2 WR starters,
+        // 1 TE / K / DEF starter so only RB is short of the league's 2-RB
+        // requirement. A single bench RB keeps that bench thin too. Other
+        // positions have enough depth that they shouldn't outrank RB.
+        let starter_qb = test_player("Patrick", "Mahomes", "QB", Some("KC"));
+        let starter_rb = test_player("Saquon", "Barkley", "RB", Some("PHI"));
+        let starter_wr1 = test_player("Justin", "Jefferson", "WR", Some("MIN"));
+        let starter_wr2 = test_player("CeeDee", "Lamb", "WR", Some("DAL"));
+        let starter_te = test_player("Travis", "Kelce", "TE", Some("KC"));
+        let starter_k = test_player("Justin", "Tucker", "K", Some("BAL"));
+        let starter_def = test_player("Defense", "SF", "DEF", Some("SF"));
+        let bench_rb = test_player("Tyjae", "Spears", "RB", Some("TEN"));
+        let bench_qb = test_player("Backup", "QB", "QB", Some("CHI"));
+        let bench_wr = test_player("Bench", "WR", "WR", Some("LAR"));
+        let bench_te = test_player("Bench", "TE", "TE", Some("NYJ"));
+        // Free agents that should appear on the waiver wire — one RB, one WR.
+        let fa_rb = test_player("Top", "AvailableRB", "RB", Some("DAL"));
+        let fa_wr = test_player("Top", "AvailableWR", "WR", Some("DAL"));
+        let fa_qb = test_player("Backup", "AvailableQB", "QB", Some("DAL"));
+
+        let players = HashMap::from([
+            ("starter_qb".to_string(), starter_qb),
+            ("starter_rb".to_string(), starter_rb),
+            ("starter_wr1".to_string(), starter_wr1),
+            ("starter_wr2".to_string(), starter_wr2),
+            ("starter_te".to_string(), starter_te),
+            ("starter_k".to_string(), starter_k),
+            ("starter_def".to_string(), starter_def),
+            ("bench_rb".to_string(), bench_rb),
+            ("bench_qb".to_string(), bench_qb),
+            ("bench_wr".to_string(), bench_wr),
+            ("bench_te".to_string(), bench_te),
+            ("fa_rb".to_string(), fa_rb),
+            ("fa_wr".to_string(), fa_wr),
+            ("fa_qb".to_string(), fa_qb),
+        ]);
+
+        let users = vec![User {
+            user_id: "user-1".to_string(),
+            display_name: Some("Nick".to_string()),
+            metadata: Some(UserMetadata {
+                team_name: Some("Touchdown Tyrants".to_string()),
+            }),
+        }];
+
+        let rosters = vec![Roster {
+            roster_id: 1,
+            owner_id: Some("user-1".to_string()),
+            players: Some(vec![
+                "starter_qb".to_string(),
+                "starter_rb".to_string(),
+                "starter_wr1".to_string(),
+                "starter_wr2".to_string(),
+                "starter_te".to_string(),
+                "starter_k".to_string(),
+                "starter_def".to_string(),
+                "bench_rb".to_string(),
+                "bench_qb".to_string(),
+                "bench_wr".to_string(),
+                "bench_te".to_string(),
+            ]),
+            starters: Some(vec![
+                "starter_qb".to_string(),
+                "starter_rb".to_string(),
+                "starter_wr1".to_string(),
+                "starter_wr2".to_string(),
+                "starter_te".to_string(),
+                "starter_k".to_string(),
+                "starter_def".to_string(),
+            ]),
+            settings: Some(RosterSettings {
+                wins: Some(0),
+                losses: Some(0),
+                ties: Some(0),
+                fpts: None,
+                fpts_decimal: None,
+                fpts_against: None,
+                fpts_against_decimal: None,
+            }),
+        }];
+        let roster_names = HashMap::from([(1, "Nick (Touchdown Tyrants)".to_string())]);
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        // Give the FA WR a much higher projection than the FA RB so that
+        // ordering by raw projection would put WR first — the personalized
+        // sort must still surface the RB ahead of it because RB is weak.
+        let projections = HashMap::from([
+            (
+                "fa_rb".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(11.0),
+                    ..PlayerStats::default()
+                },
+            ),
+            (
+                "fa_wr".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(18.5),
+                    ..PlayerStats::default()
+                },
+            ),
+            (
+                "fa_qb".to_string(),
+                PlayerStats {
+                    pts_half_ppr: Some(14.0),
+                    ..PlayerStats::default()
+                },
+            ),
+        ]);
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+        let league = test_league(); // requires 2 RB starters, 2 WR, 1 QB, 1 TE, 1 FLEX, 1 K, 1 DEF
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            league: &league,
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor
+            .search_waiver_wire(None, 15, Some("Touchdown Tyrants"))
+            .unwrap();
+
+        // Header reports the matched team and a needs summary that flags RB.
+        assert!(
+            result.contains("Roster needs for Nick (Touchdown Tyrants):"),
+            "missing roster header: {result}"
+        );
+        assert!(
+            result.contains("Weak at RB"),
+            "missing RB weak flag: {result}"
+        );
+        assert!(
+            result.contains("Top available players (prioritized for this team's needs):"),
+            "missing prioritized banner: {result}"
+        );
+
+        // The RB free agent must appear before the higher-projection WR
+        // because RB is the team's weak position.
+        let rb_idx = result.find("AvailableRB").expect("RB FA listed");
+        let wr_idx = result.find("AvailableWR").expect("WR FA listed");
+        assert!(
+            rb_idx < wr_idx,
+            "expected RB before WR in personalized output:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_search_waiver_wire_personalized_team_not_found() {
+        let sleeper = SleeperClient::new();
+        let players = HashMap::new();
+        let users = Vec::new();
+        let rosters = Vec::new();
+        let roster_names = HashMap::new();
+        let nfl_state = NflState {
+            week: 1,
+            season: "2026".to_string(),
+            season_type: "regular".to_string(),
+        };
+        let historical_stats = HashMap::new();
+        let projections = HashMap::new();
+        let champions = Vec::new();
+        let all_time_stats = Vec::new();
+        let recent_transactions = Vec::new();
+        let league = test_league();
+
+        let executor = ToolExecutor {
+            sleeper: &sleeper,
+            league_id: "league",
+            league: &league,
+            players: &players,
+            users: &users,
+            rosters: &rosters,
+            roster_names: &roster_names,
+            nfl_state: &nfl_state,
+            historical_stats: &historical_stats,
+            projections: &projections,
+            champions: &champions,
+            all_time_stats: &all_time_stats,
+            scoring: "half_ppr",
+            recent_transactions: &recent_transactions,
+            gql: None,
+        };
+
+        let result = executor
+            .search_waiver_wire(None, 15, Some("Nobody"))
+            .unwrap();
+        assert!(result.contains("No team found matching \"Nobody\""));
     }
 }

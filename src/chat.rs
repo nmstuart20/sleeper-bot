@@ -52,13 +52,14 @@ pub fn build_lightweight_context(
         ""
     };
     let lineup = league.format_roster_positions();
-    let scoring_fmt = league
-        .format_scoring_highlights()
-        .unwrap_or_else(|| match league.detect_scoring() {
-            "ppr" => "full PPR".to_string(),
-            "std" => "standard".to_string(),
-            _ => "half PPR".to_string(),
-        });
+    let scoring_fmt =
+        league
+            .format_scoring_highlights()
+            .unwrap_or_else(|| match league.detect_scoring() {
+                "ppr" => "full PPR".to_string(),
+                "std" => "standard".to_string(),
+                _ => "half PPR".to_string(),
+            });
 
     let user_map: HashMap<&str, &User> = users.iter().map(|u| (u.user_id.as_str(), u)).collect();
 

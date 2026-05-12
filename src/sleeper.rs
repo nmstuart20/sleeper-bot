@@ -211,8 +211,10 @@ impl League {
         }
         // Append any unrecognised starter slots alphabetically so the LLM can
         // still target them.
-        let mut leftover: Vec<&String> =
-            seen.iter().filter(|k| !emitted.contains(k.as_str())).collect();
+        let mut leftover: Vec<&String> = seen
+            .iter()
+            .filter(|k| !emitted.contains(k.as_str()))
+            .collect();
         leftover.sort();
         for k in leftover {
             ordered.push(k.clone());
@@ -1263,12 +1265,8 @@ mod tests {
             total_rosters,
             roster_positions: roster_positions
                 .map(|v| v.into_iter().map(|s| s.to_string()).collect()),
-            scoring_settings: scoring.map(|pairs| {
-                pairs
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect()
-            }),
+            scoring_settings: scoring
+                .map(|pairs| pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
             settings: Some(settings),
         }
     }
@@ -1292,13 +1290,27 @@ mod tests {
             "std"
         );
         // Falls back to half_ppr when scoring_settings is missing.
-        assert_eq!(build_league(None, None, None, None).detect_scoring(), "half_ppr");
+        assert_eq!(
+            build_league(None, None, None, None).detect_scoring(),
+            "half_ppr"
+        );
     }
 
     #[test]
     fn test_is_superflex() {
         let sf = build_league(
-            Some(vec!["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "K", "DEF"]),
+            Some(vec![
+                "QB",
+                "RB",
+                "RB",
+                "WR",
+                "WR",
+                "TE",
+                "FLEX",
+                "SUPER_FLEX",
+                "K",
+                "DEF",
+            ]),
             None,
             None,
             None,
@@ -1318,8 +1330,23 @@ mod tests {
     fn test_format_roster_positions_orders_starters_first() {
         let league = build_league(
             Some(vec![
-                "QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "K", "DEF", "BN",
-                "BN", "BN", "BN", "IR", "IR",
+                "QB",
+                "RB",
+                "RB",
+                "WR",
+                "WR",
+                "WR",
+                "TE",
+                "FLEX",
+                "SUPER_FLEX",
+                "K",
+                "DEF",
+                "BN",
+                "BN",
+                "BN",
+                "BN",
+                "IR",
+                "IR",
             ]),
             None,
             None,
@@ -1364,12 +1391,7 @@ mod tests {
 
     #[test]
     fn test_format_scoring_highlights_standard_no_extras() {
-        let league = build_league(
-            None,
-            Some(vec![("rec", 0.0), ("pass_td", 4.0)]),
-            None,
-            None,
-        );
+        let league = build_league(None, Some(vec![("rec", 0.0), ("pass_td", 4.0)]), None, None);
         let highlights = league.format_scoring_highlights().unwrap();
         // Standard scoring with default 4pt pass TDs — only the PPR label is emitted.
         assert_eq!(highlights, "standard (no PPR)");
@@ -1379,8 +1401,20 @@ mod tests {
     fn test_format_summary_dynasty_superflex_full_ppr() {
         let league = build_league(
             Some(vec![
-                "QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "SUPER_FLEX", "K", "DEF", "BN",
-                "BN", "BN",
+                "QB",
+                "RB",
+                "RB",
+                "WR",
+                "WR",
+                "WR",
+                "TE",
+                "FLEX",
+                "SUPER_FLEX",
+                "K",
+                "DEF",
+                "BN",
+                "BN",
+                "BN",
             ]),
             Some(vec![("rec", 1.0), ("pass_td", 6.0), ("bonus_rec_te", 0.5)]),
             Some(2),
@@ -1388,7 +1422,11 @@ mod tests {
         );
         let summary = league.format_summary(None);
         assert!(summary.starts_with("10-team superflex dynasty league."));
-        assert!(summary.contains("Lineup: 1 QB, 2 RB, 3 WR, 1 TE, 1 SUPER_FLEX, 1 FLEX, 1 K, 1 DEF, 3 BN."));
+        assert!(
+            summary.contains(
+                "Lineup: 1 QB, 2 RB, 3 WR, 1 TE, 1 SUPER_FLEX, 1 FLEX, 1 K, 1 DEF, 3 BN."
+            )
+        );
         assert!(summary.contains("Scoring: full PPR, 6pt pass TDs, +0.5 TE premium."));
         assert!(!summary.contains("Additional notes"));
     }
@@ -1497,8 +1535,14 @@ mod tests {
 
         // The full summary should include the team count, lineup, and scoring.
         let summary = league.format_summary(None);
-        assert!(summary.contains("Lineup:"), "summary missing Lineup: {summary}");
-        assert!(summary.contains("Scoring:"), "summary missing Scoring: {summary}");
+        assert!(
+            summary.contains("Lineup:"),
+            "summary missing Lineup: {summary}"
+        );
+        assert!(
+            summary.contains("Scoring:"),
+            "summary missing Scoring: {summary}"
+        );
 
         // Sanity-check the superflex flag against the raw positions.
         let raw_has_sf = positions.iter().any(|p| {

@@ -4,34 +4,6 @@ Run these prompts sequentially from your `sleeper-bot` project root. Each prompt
 
 ---
 
-## 8. Add Roster-Aware Waiver Recommendations
-
-```
-In src/tools.rs, enhance the `search_waiver_wire` tool to optionally recommend players based on a specific team's roster needs.
-
-1. Add an optional `for_team` parameter to the tool definition:
-   "for_team": {
-       "type": "string",
-       "description": "Optional: team/owner name to get personalized waiver recommendations based on their roster's weakest positions. When provided, the tool analyzes the team's roster depth at each position and prioritizes waiver picks that fill gaps."
-   }
-
-2. Update the `SearchWaiverWire` variant to include `for_team: Option<String>`.
-
-3. In the `search_waiver_wire` implementation, when `for_team` is provided:
-   a. Find the team's roster using the same fuzzy matching as get_team_roster
-   b. Count starters at each position (QB, RB, WR, TE)
-   c. Identify positions with fewer starters than typical lineup requirements (e.g. only 1 RB when the league starts 2)
-   d. Also identify positions where the bench depth is thin (0-1 bench players at that position)
-   e. Prepend a "Roster needs:" summary like "Weak at RB (1 starter, 1 bench). WR depth is thin (0 bench)."
-   f. Then show the waiver results, but sort/group by the team's needs first — show players at weak positions first, then other positions
-
-4. When `for_team` is not provided, behavior is unchanged from the current implementation.
-
-5. Update parse_tool_call and add tests.
-```
-
----
-
 ## 9. Add Weekly Recap Command
 
 ```
